@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+venv/
+logs/
+state.json
+/password
+/tmp/
