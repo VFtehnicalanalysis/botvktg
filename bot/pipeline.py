@@ -103,6 +103,17 @@ class Pipeline:
         existing_hash = existing.get("hash")
         status = existing.get("status")
         already_published = str(status).startswith("published")
+        if force:
+            stale_ids = self._normalize_message_ids(existing.get("moderation_message_ids"))
+            if stale_ids:
+                deleted = await self.tg.delete_messages(self.config.owner_id, stale_ids)
+                log.info(
+                    "Deleted stale %s/%s post moderation messages before re-send for %s",
+                    deleted,
+                    len(stale_ids),
+                    post_id,
+                )
+                await self.state.clear_moderation_message_ids(post_id)
         if not force and existing_hash == content_hash:
             log.info("Skip post %s (duplicate hash)", post_id)
             return
@@ -166,18 +177,35 @@ class Pipeline:
                 await self.state.mark_rejected(post_id)
                 await self.state.invalidate_token(token)
                 await self._delete_post_moderation_messages(post_id)
+                await self._notify_post_result(
+                    published=False,
+                    source_link=payload.get("vk_url", ""),
+                    publish_tg=False,
+                    tg_message_ids=[],
+                    publish_vk=False,
+                    vk_link=None,
+                )
                 if cb_id:
                     await self.tg.answer_callback_query(cb_id, text="Отклонено")
                 return
             await self.state.mark_approved(post_id)
             await self.state.invalidate_token(token)
+            tg_message_ids: List[int] = []
             if action in {"tg", "both"}:
-                await self._publish(post_id, payload)
-                if cb_id:
-                    await self.tg.answer_callback_query(cb_id, text="Опубликовано в TG")
-            else:
-                if cb_id:
-                    await self.tg.answer_callback_query(cb_id, text="Оставлено только в ВК")
+                tg_message_ids = await self._publish(post_id, payload, notify_owner=False)
+            publish_vk = action in {"vk", "both"}
+            vk_link = payload.get("vk_url", "") if publish_vk else None
+            await self._delete_post_moderation_messages(post_id)
+            await self._notify_post_result(
+                published=True,
+                source_link=payload.get("vk_url", ""),
+                publish_tg=action in {"tg", "both"},
+                tg_message_ids=tg_message_ids,
+                publish_vk=publish_vk,
+                vk_link=vk_link,
+            )
+            if cb_id:
+                await self.tg.answer_callback_query(cb_id, text="Опубликовано")
         elif data.startswith("approve:") or data.startswith("reject:"):
             if user_id != self.config.owner_id:
                 if cb_id:
@@ -197,13 +225,30 @@ class Pipeline:
             if action == "approve":
                 await self.state.mark_approved(post_id)
                 await self.state.invalidate_token(token)
-                await self._publish(post_id, payload)
+                tg_message_ids = await self._publish(post_id, payload, notify_owner=False)
+                await self._delete_post_moderation_messages(post_id)
+                await self._notify_post_result(
+                    published=True,
+                    source_link=payload.get("vk_url", ""),
+                    publish_tg=True,
+                    tg_message_ids=tg_message_ids,
+                    publish_vk=False,
+                    vk_link=None,
+                )
                 if cb_id:
                     await self.tg.answer_callback_query(cb_id, text="Опубликовано в TG")
             elif action == "reject":
                 await self.state.mark_rejected(post_id)
                 await self.state.invalidate_token(token)
                 await self._delete_post_moderation_messages(post_id)
+                await self._notify_post_result(
+                    published=False,
+                    source_link=payload.get("vk_url", ""),
+                    publish_tg=False,
+                    tg_message_ids=[],
+                    publish_vk=False,
+                    vk_link=None,
+                )
                 if cb_id:
                     await self.tg.answer_callback_query(cb_id, text="Отклонено")
         elif data.startswith("approve_news:") or data.startswith("reject_news:") or data.startswith("news:"):
@@ -238,6 +283,15 @@ class Pipeline:
                 await self.state.mark_news_rejected(url)
                 await self.state.invalidate_news_token(token)
                 await self._delete_news_moderation_messages(url)
+                await self._notify_news_result(
+                    published=False,
+                    source_link=url,
+                    publish_tg=False,
+                    tg_message_ids=[],
+                    publish_vk=False,
+                    vk_post_id=None,
+                    is_digest=self._is_digest_payload(payload),
+                )
                 if cb_id:
                     await self.tg.answer_callback_query(cb_id, text="Отклонено")
                 return
@@ -246,7 +300,23 @@ class Pipeline:
             publish_tg = action in {"tg", "both"} or action == "approve_news"
             await self.state.mark_news_approved(url)
             await self.state.invalidate_news_token(token)
-            await self._publish_news(url, payload, publish_vk=publish_vk, publish_tg=publish_tg)
+            tg_message_ids, vk_post_id = await self._publish_news(
+                url,
+                payload,
+                publish_vk=publish_vk,
+                publish_tg=publish_tg,
+                notify_owner=False,
+            )
+            await self._delete_news_moderation_messages(url)
+            await self._notify_news_result(
+                published=True,
+                source_link=url,
+                publish_tg=publish_tg,
+                tg_message_ids=tg_message_ids,
+                publish_vk=publish_vk,
+                vk_post_id=vk_post_id,
+                is_digest=self._is_digest_payload(payload),
+            )
             if cb_id:
                 await self.tg.answer_callback_query(cb_id, text="Опубликовано")
 
@@ -309,6 +379,72 @@ class Pipeline:
     def _hash_payload(self, payload: Dict[str, Any]) -> str:
         dumped = json.dumps(payload, sort_keys=True, ensure_ascii=True)
         return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+
+    def _is_digest_payload(self, payload: Dict[str, Any]) -> bool:
+        if bool(payload.get("is_digest")):
+            return True
+        url_l = str(payload.get("url") or "").lower()
+        title_l = str(payload.get("title") or "").lower()
+        text_l = str(payload.get("text") or "").lower()
+        if "/digest/" in url_l or "дайджест" in title_l or "digest" in title_l:
+            return True
+        digest_markers = (
+            "юбилейные встречи выпускников",
+            "ef msu alumni",
+            "alumni@econ.msu.ru",
+            "группы для нашего общения",
+        )
+        return any(marker in text_l for marker in digest_markers)
+
+    def _is_digest_news(self, url: str = "", payload: Optional[Dict[str, Any]] = None) -> bool:
+        payload_obj = payload or {}
+        if self._is_digest_payload(payload_obj):
+            return True
+        source_url_l = str(url or "").lower()
+        payload_url_l = str(payload_obj.get("url") or "").lower()
+        title_l = str(payload_obj.get("title") or "").lower()
+        return (
+            "/digest/" in source_url_l
+            or "/digest/" in payload_url_l
+            or "дайджест" in title_l
+            or "digest" in title_l
+        )
+
+    def _trim_digest_footer_text(self, text: str) -> str:
+        if not text:
+            return ""
+        marker = "юбилейные встречи"
+        idx = text.lower().find(marker)
+        if idx != -1:
+            return text[:idx].rstrip()
+        return text.strip()
+
+    def _normalize_message_ids(self, raw_value: Any) -> List[int]:
+        if not isinstance(raw_value, list):
+            return []
+        normalized: List[int] = []
+        for item in raw_value:
+            try:
+                message_id = int(item)
+            except (TypeError, ValueError):
+                continue
+            normalized.append(message_id)
+        return normalized
+
+    def _split_photo_caption_and_chunks(
+        self,
+        chunks: Sequence[str],
+        caption_limit: int = 1000,
+    ) -> Tuple[Optional[str], List[str]]:
+        if not chunks:
+            return None, []
+        first = chunks[0] or ""
+        caption = first[:caption_limit] if first else ""
+        tail = first[caption_limit:]
+        extras = [part for part in chunks[1:] if part]
+        if tail:
+            extras.insert(0, tail)
+        return (caption or None), extras
 
     def _format_news_text(
         self, payload: Dict[str, Any], html: bool = True, include_body: bool = True
@@ -420,7 +556,12 @@ class Pipeline:
                 message_ids.append(mid)
         await self.state.set_moderation_message_ids(post_id, message_ids)
 
-    async def _publish(self, post_id: int, payload: Dict[str, Any]) -> None:
+    async def _publish(
+        self,
+        post_id: int,
+        payload: Dict[str, Any],
+        notify_owner: bool = True,
+    ) -> List[int]:
         text = payload.get("text", "") or ""
         media: List[Dict[str, Any]] = payload.get("media") or []
         poll = payload.get("poll")
@@ -432,28 +573,28 @@ class Pipeline:
         if media:
             if len(media) == 1:
                 m = media[0]
-                cap = chunks[0] if chunks else None
+                cap, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
                 msg_id = await self.tg.send_photo(
                     chat_id=self.config.tg_channel_id, photo=m["url"], caption=cap
                 )
                 if msg_id:
                     message_ids.append(msg_id)
-                for extra in chunks[1:]:
+                for extra in extra_chunks:
                     mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra)
                     if mid:
                         message_ids.append(mid)
             else:
-                caption = chunks[0] if chunks else ""
+                caption, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
                 group: List[Dict[str, Any]] = []
                 for idx, m in enumerate(media):
                     entry = {"type": m["type"], "media": m["url"]}
                     if idx == 0 and caption:
-                        entry["caption"] = caption[:1000]
+                        entry["caption"] = caption
                         entry["parse_mode"] = "HTML"
                     group.append(entry)
                 mids = await self._send_media_group_safe(self.config.tg_channel_id, group)
                 message_ids.extend(mids)
-                for extra in chunks[1:]:
+                for extra in extra_chunks:
                     mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra)
                     if mid:
                         message_ids.append(mid)
@@ -475,15 +616,34 @@ class Pipeline:
 
         await self.state.mark_published(post_id, message_ids)
         log.info("Published post %s to channel with %d messages", post_id, len(message_ids))
-        if not self.config.dry_run:
+        if notify_owner and not self.config.dry_run:
             try:
-                await self.tg.notify_owner(f"Пост {post_id} опубликован в канал, сообщений: {len(message_ids)}")
+                lines = [f"Пост {post_id} опубликован в канал, сообщений: {len(message_ids)}."]
+                tg_link = self._build_tg_message_link(message_ids)
+                if tg_link:
+                    lines.append(f"Ссылка TG: {tg_link}")
+                vk_source = payload.get("vk_url", "") or ""
+                if vk_source:
+                    lines.append(f"Исходный пост ВК: {vk_source}")
+                await self.tg.notify_owner("\n".join(lines))
             except Exception as exc:  # noqa: BLE001
                 log.warning("Failed to notify owner about publish: %s", exc)
+        return message_ids
 
     async def handle_news(self, news: Dict[str, Any], force: bool = False) -> None:
         url = news["url"]
         existing = await self.state.get_news_record(url)
+        if force and existing:
+            stale_ids = self._normalize_message_ids(existing.get("moderation_message_ids"))
+            if stale_ids:
+                deleted = await self.tg.delete_messages(self.config.owner_id, stale_ids)
+                log.info(
+                    "Deleted stale %s/%s news moderation messages before re-send for %s",
+                    deleted,
+                    len(stale_ids),
+                    url,
+                )
+                await self.state.clear_news_moderation_message_ids(url)
         if existing and not force:
             status = existing.get("status")
             if status in {"approved", "pending", "rejected"} or str(status).startswith("published"):
@@ -494,17 +654,28 @@ class Pipeline:
             if self.site
             else {"text": "", "images": []}
         )
+        canonical_url = str(detail.get("canonical_url") or url)
         title = news.get("title") or detail.get("title", "")
         date = news.get("date") or detail.get("date", "")
         payload = {
-            "url": url,
+            "url": canonical_url,
             "title": title or "",
             "date": date or "",
             "text": detail.get("text", ""),
             "images": detail.get("images", []),
         }
-        if detail.get("is_digest") or "/digest/" in url.lower():
+        is_digest = (
+            bool(news.get("is_digest"))
+            or bool(detail.get("is_digest"))
+            or "/digest/" in canonical_url.lower()
+            or self._is_digest_payload(payload)
+        )
+        if is_digest:
+            payload["text"] = self._trim_digest_footer_text(str(payload.get("text") or ""))
             payload["images"] = payload.get("images", [])[:1]
+            payload["is_digest"] = True
+        else:
+            payload["is_digest"] = False
         content_hash = self._hash_payload(payload)
         if not force and await self.state.news_should_skip(url, content_hash):
             log.info("Skip news (hash): %s", url)
@@ -519,7 +690,16 @@ class Pipeline:
 
     async def _send_news_for_moderation(self, url: str, payload: Dict[str, Any], token: Optional[str]) -> None:
         text_body = escape_html(payload.get("text", "")) or "(без текста)"
-        header = f"Новая новость на сайте:\n{self._format_news_text(payload, html=True, include_body=False)}"
+        is_digest = self._is_digest_news(url=url, payload=payload)
+        log.info(
+            "News moderation type digest=%s source_url=%s payload_url=%s payload_is_digest=%s",
+            is_digest,
+            url,
+            payload.get("url", ""),
+            payload.get("is_digest"),
+        )
+        header_prefix = "Новый дайджест на сайте" if is_digest else "Новая новость на сайте"
+        header = f"{header_prefix}:\n{self._format_news_text(payload, html=True, include_body=False)}"
         chunks = chunk_text(f"{header}\n\n{text_body}", limit=1000)
         keyboard = {
             "inline_keyboard": [
@@ -543,7 +723,8 @@ class Pipeline:
             mid = await self.tg.send_message(chat_id=self.config.owner_id, text=extra)
             if mid:
                 message_ids.append(mid)
-        images: List[str] = payload.get("images", [])[:10]
+        all_images: List[str] = payload.get("images", []) or []
+        images: List[str] = all_images[:1] if is_digest else all_images[:10]
         if len(images) == 1:
             mid = await self.tg.send_photo(chat_id=self.config.owner_id, photo=images[0])
             if mid:
@@ -560,7 +741,8 @@ class Pipeline:
         payload: Dict[str, Any],
         publish_vk: bool = False,
         publish_tg: bool = True,
-    ) -> None:
+        notify_owner: bool = True,
+    ) -> Tuple[List[int], Optional[int]]:
         message_ids: Optional[List[int]] = None
         vk_post_id: Optional[int] = None
         if publish_tg:
@@ -580,42 +762,47 @@ class Pipeline:
             vk_post_id=vk_post_id,
             published_to=published_to,
         )
-        if not self.config.dry_run:
+        if notify_owner and not self.config.dry_run:
             try:
-                await self.tg.notify_owner(f"Новость опубликована: {url} ({published_to})")
+                entity_name = "Дайджест" if self._is_digest_news(url=url, payload=payload) else "Новость"
+                await self.tg.notify_owner(f"{entity_name} опубликован: {url} ({published_to})")
             except Exception as exc:  # noqa: BLE001
                 log.warning("Failed to notify owner about news publish: %s", exc)
+        return message_ids or [], vk_post_id
 
     async def _publish_news_tg(self, payload: Dict[str, Any]) -> List[int]:
         full_text = self._format_news_text(payload, html=True)
         message_ids: List[int] = []
         chunks = chunk_text(full_text, limit=3500)
-        images: List[str] = payload.get("images", [])[:10]
+        all_images: List[str] = payload.get("images", []) or []
+        images: List[str] = all_images[:1] if self._is_digest_news(payload=payload) else all_images[:10]
 
         if images:
             if len(images) == 1:
+                caption, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
                 mid = await self.tg.send_photo(
                     chat_id=self.config.tg_channel_id,
                     photo=images[0],
-                    caption=chunks[0] if chunks else None,
+                    caption=caption,
                 )
                 if mid:
                     message_ids.append(mid)
-                for extra in chunks[1:]:
+                for extra in extra_chunks:
                     mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra)
                     if mid:
                         message_ids.append(mid)
             else:
+                caption, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
                 group = []
                 for idx, img in enumerate(images):
                     entry = {"type": "photo", "media": img}
-                    if idx == 0 and chunks:
-                        entry["caption"] = chunks[0][:1000]
+                    if idx == 0 and caption:
+                        entry["caption"] = caption
                         entry["parse_mode"] = "HTML"
                     group.append(entry)
                 mids = await self._send_media_group_safe(self.config.tg_channel_id, group)
                 message_ids.extend(mids)
-                for extra in chunks[1:]:
+                for extra in extra_chunks:
                     mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra)
                     if mid:
                         message_ids.append(mid)
@@ -633,13 +820,95 @@ class Pipeline:
         if len(text) > 6000:
             text = text[:6000] + "…"
         attachments: List[str] = []
-        images: List[str] = payload.get("images", [])[:10]
+        all_images: List[str] = payload.get("images", []) or []
+        is_digest = self._is_digest_news(payload=payload)
+        images: List[str] = all_images[:1] if is_digest else all_images[:10]
         if images and not self.config.dry_run:
-            attachments = await self.vk.upload_wall_photos(images, max_images=10)
+            max_images = 1 if is_digest else 10
+            attachments = await self.vk.upload_wall_photos(images, max_images=max_images)
         if self.config.dry_run:
             log.info("[dry-run] VK wall.post: %s", text[:200])
             return None
         return await self.vk.wall_post(message=text, attachments=attachments)
+
+    def _build_tg_message_link(self, message_ids: Sequence[int]) -> Optional[str]:
+        if not message_ids:
+            return None
+        message_id = message_ids[0]
+        chat = str(self.config.tg_channel_id).strip()
+        if chat.startswith("https://t.me/"):
+            return f"{chat.rstrip('/')}/{message_id}"
+        if chat.startswith("@"):
+            username = chat[1:]
+            return f"https://t.me/{username}/{message_id}" if username else None
+        if chat.startswith("-100") and chat[4:].isdigit():
+            return f"https://t.me/c/{chat[4:]}/{message_id}"
+        if chat and not chat.startswith("-"):
+            return f"https://t.me/{chat}/{message_id}"
+        return None
+
+    def _build_vk_post_link(self, vk_post_id: Optional[int]) -> Optional[str]:
+        if not vk_post_id:
+            return None
+        return f"https://vk.com/wall-{abs(self.config.vk_group_id)}_{vk_post_id}"
+
+    async def _notify_post_result(
+        self,
+        published: bool,
+        source_link: str,
+        publish_tg: bool,
+        tg_message_ids: Sequence[int],
+        publish_vk: bool,
+        vk_link: Optional[str],
+    ) -> None:
+        tg_link = self._build_tg_message_link(tg_message_ids) if publish_tg else None
+        lines = ["Публикация поста отклонена."]
+        if published:
+            lines[0] = "Пост опубликован."
+            published_links: List[str] = []
+            if tg_link:
+                published_links.append(f"TG: {tg_link}")
+            if publish_vk and vk_link:
+                published_links.append(f"ВК: {vk_link}")
+            if published_links:
+                lines.append(f"Публикация: {', '.join(published_links)}")
+        lines.append(f"Исходный пост ВК: {source_link}")
+        try:
+            await self.tg.notify_owner("\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to notify owner about post moderation result: %s", exc)
+
+    async def _notify_news_result(
+        self,
+        published: bool,
+        source_link: str,
+        publish_tg: bool,
+        tg_message_ids: Sequence[int],
+        publish_vk: bool,
+        vk_post_id: Optional[int],
+        is_digest: bool = False,
+    ) -> None:
+        tg_link = self._build_tg_message_link(tg_message_ids) if publish_tg else None
+        vk_link = self._build_vk_post_link(vk_post_id) if publish_vk else None
+        lines = ["Публикация новости отклонена."]
+        if is_digest:
+            lines = ["Публикация дайджеста отклонена."]
+        if published:
+            lines[0] = "Новость опубликована."
+            if is_digest:
+                lines[0] = "Дайджест опубликован."
+            published_links: List[str] = []
+            if tg_link:
+                published_links.append(f"TG: {tg_link}")
+            if vk_link:
+                published_links.append(f"ВК: {vk_link}")
+            if published_links:
+                lines.append(f"Публикация: {', '.join(published_links)}")
+        lines.append(f"Исходная новость: {source_link}")
+        try:
+            await self.tg.notify_owner("\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to notify owner about news moderation result: %s", exc)
 
     async def _delete_post_moderation_messages(self, post_id: int) -> None:
         message_ids = await self.state.get_moderation_message_ids(post_id)

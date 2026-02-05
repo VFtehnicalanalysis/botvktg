@@ -62,6 +62,9 @@ class VKClient:
             raise RuntimeError("LongPoll server is empty")
         try:
             resp = await self.client.get(url, params=params)
+        except httpx.ReadTimeout:
+            log.warning("LongPoll timeout (server=%s), continue polling", self.longpoll_server)
+            return self.ts, []
         except httpx.RequestError as exc:
             log.error("LongPoll request error (server=%s): %s", self.longpoll_server, exc)
             # Попробуем обновить сервер, чтобы получить новый host

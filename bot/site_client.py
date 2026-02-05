@@ -113,6 +113,25 @@ class FeedParser(HTMLParser):
             self._current_text.append(text)
 
 
+class AEFNewsIconParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.urls: List[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_map = dict(attrs)
+        class_value = (attrs_map.get("class") or "").lower()
+        if "aef_news_icon" not in class_value:
+            return
+        style = attrs_map.get("style") or ""
+        match = re.search(r"background-image\s*:\s*url\(([^)]+)\)", style, re.I)
+        if not match:
+            return
+        raw_url = match.group(1).strip().strip("'\"")
+        if raw_url:
+            self.urls.append(raw_url)
+
+
 class SiteClient:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -128,7 +147,7 @@ class SiteClient:
             url_l = url_l[len(base) :]
         return _is_news_link(url_l)
 
-    async def fetch_latest_news(self) -> Optional[Dict[str, str]]:
+    async def fetch_latest_news(self) -> Optional[Dict[str, object]]:
         url = f"{self.config.site_base_url}{self.config.site_news_path}"
         resp = await self.client.get(url)
         resp.raise_for_status()
@@ -139,7 +158,13 @@ class SiteClient:
         if parser.items:
             item = parser.items[0]
             full_url = _abs_url(self.config.site_base_url, item["url"])
-            return {"url": full_url, "title": item.get("title", ""), "date": item.get("date", "")}
+            title = item.get("title", "")
+            return {
+                "url": full_url,
+                "title": title,
+                "date": item.get("date", ""),
+                "is_digest": self._is_digest(title, url=full_url),
+            }
 
         # Fallback на старую вёрстку
         block_match = re.search(
@@ -171,37 +196,40 @@ class SiteClient:
         else:
             date = ""
         full_url = _abs_url(self.config.site_base_url, link)
-        return {"url": full_url, "title": title, "date": date}
+        return {
+            "url": full_url,
+            "title": title,
+            "date": date,
+            "is_digest": self._is_digest(title, url=full_url),
+        }
 
     async def fetch_news_detail(self, url: str, title: Optional[str] = None) -> Dict[str, object]:
-        resp = await self.client.get(url)
+        resp = await self.client.get(url, follow_redirects=True)
         resp.raise_for_status()
         html = unescape(resp.text)
+        final_url = str(resp.url)
         content_html = self._extract_main_block(html)
         extracted_title = title or self._extract_title(content_html, html)
         extracted_date = self._extract_date(content_html, html)
         # текст
-        is_digest = self._is_digest(extracted_title, url=url)
+        is_digest = self._is_digest(extracted_title, url=final_url or url) or self._looks_like_digest_page(html)
         parser = TextExtractor()
         parser.feed(content_html)
-        text = self._clean_text(parser.text(), extracted_title, is_digest=is_digest)
+        raw_text = parser.text()
+        if not is_digest and self._looks_like_digest_text(raw_text, html):
+            is_digest = True
+        text = self._clean_text(raw_text, extracted_title, is_digest=is_digest)
         # изображения: только с нашего домена, допустимые расширения или raw.php
         images: List[str] = []
-        icon_images: List[str] = []
         if is_digest:
-            icon_images = self._extract_aef_news_icon_images(content_html)
-            if not icon_images:
-                icon_images = self._extract_aef_news_icon_images(html)
-        if is_digest:
+            icon_images = self._extract_aef_news_icon_images(html)
             if icon_images:
-                images.extend(icon_images[:3])
+                images.append(icon_images[0])
             else:
-                raw_images = self._extract_raw_images(content_html, only_image_param=True)
-                if not raw_images:
-                    raw_images = self._extract_raw_images(html, only_image_param=True)
-                if raw_images:
-                    images.extend(raw_images)
-        if not images:
+                feed_icon = await self._fetch_digest_icon_from_feed(url)
+                if feed_icon:
+                    images.append(feed_icon)
+        else:
             imgs = re.findall(r'<img[^>]+src="([^"]+)"', content_html)
             for src in imgs:
                 if not self._is_candidate_image(src):
@@ -227,6 +255,7 @@ class SiteClient:
             "is_digest": is_digest,
             "title": extracted_title or "",
             "date": extracted_date or "",
+            "canonical_url": final_url or url,
         }
 
     def _is_candidate_image(self, src: str) -> bool:
@@ -280,18 +309,50 @@ class SiteClient:
 
     def _extract_aef_news_icon_images(self, html: str) -> List[str]:
         urls: List[str] = []
-        for match in re.finditer(r'<div[^>]*class="[^"]*aef_news_icon[^"]*"[^>]*>', html, re.I):
-            tag = match.group(0)
-            style_match = re.search(r'background-image:\s*url\(([^)]+)\)', tag, re.I)
-            if not style_match:
-                continue
-            cleaned = style_match.group(1).strip().strip("'\"")
+        parser = AEFNewsIconParser()
+        parser.feed(html)
+        for cleaned in parser.urls:
             if not cleaned:
                 continue
             if not self._is_candidate_image(cleaned):
                 continue
             urls.append(_abs_url(self.config.site_base_url, cleaned))
         return urls
+
+    async def _fetch_digest_icon_from_feed(self, news_url: str) -> Optional[str]:
+        try:
+            feed_url = f"{self.config.site_base_url}{self.config.site_news_path}"
+            resp = await self.client.get(feed_url)
+            resp.raise_for_status()
+        except httpx.RequestError as exc:
+            log.warning("Failed to fetch feed for digest icon: %s", exc)
+            return None
+        except httpx.HTTPStatusError as exc:
+            log.warning("Failed to fetch feed for digest icon (status): %s", exc)
+            return None
+        html = unescape(resp.text)
+        return self._extract_news_icon_by_url(html, news_url)
+
+    def _extract_news_icon_by_url(self, html: str, news_url: str) -> Optional[str]:
+        base = self.config.site_base_url
+        target_full = _abs_url(base, news_url)
+        blocks = re.findall(
+            r'<div class="w33[^"]*status-Published"[^>]*>(.*?)</div>\s*</div>',
+            html,
+            re.S | re.I,
+        )
+        for block in blocks:
+            link_match = re.search(r'<h3 class="news_text">\s*<a href="([^"]+)"', block, re.S | re.I)
+            if not link_match:
+                continue
+            href = link_match.group(1).strip()
+            href_full = _abs_url(base, href)
+            if href_full != target_full:
+                continue
+            icons = self._extract_aef_news_icon_images(block)
+            if icons:
+                return icons[0]
+        return None
 
     def _extract_raw_images(self, html: str, only_image_param: bool) -> List[str]:
         urls: List[str] = []
@@ -305,6 +366,28 @@ class SiteClient:
         title_l = (title or "").lower()
         url_l = (url or "").lower()
         return ("дайджест" in title_l) or ("digest" in title_l) or ("/digest/" in url_l)
+
+    def _looks_like_digest_page(self, html: str) -> bool:
+        html_l = html.lower()
+        return (
+            "aef_news_icon" in html_l
+            or "/ext/digest/" in html_l
+            or "ext/digest/" in html_l
+        )
+
+    def _looks_like_digest_text(self, text: str, html: str) -> bool:
+        text_l = text.lower()
+        html_l = html.lower()
+        markers = (
+            "юбилейные встречи выпускников",
+            "организовать встречу выпуска",
+            "ef msu alumni",
+            "alumni@econ.msu.ru",
+            "группы для нашего общения",
+        )
+        if any(marker in text_l for marker in markers):
+            return True
+        return any(marker in html_l for marker in markers)
 
     def _extract_title(self, content_html: str, html: str) -> str:
         for source in (content_html, html):
@@ -337,14 +420,11 @@ class SiteClient:
         return re.sub(r"\s+", " ", text).strip()
 
     def _clean_text(self, text: str, title: Optional[str], is_digest: bool = False) -> str:
-        if is_digest:
-            text = re.sub(
-                r"Юбилейные встречи выпускников.*?Группы для нашего общения",
-                "",
-                text,
-                flags=re.S | re.I,
-            )
         text = text.replace("\xa0", " ")
+        if is_digest:
+            marker = re.search(r"юбилейные\s+встречи", text, flags=re.I)
+            if marker:
+                text = text[: marker.start()]
         lines = [ln.strip() for ln in text.splitlines()]
         cleaned: List[str] = []
         title_norm = (title or "").replace("\xa0", " ").strip().lower()

@@ -112,7 +112,6 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                         url = _extract_first_url(text)
                         if url and pipeline.site and pipeline.site.is_supported_news_url(url):
                             await pipeline.handle_news({"url": url, "title": "", "date": ""}, force=True)
-                            await tg.notify_owner(f"Новость поставлена на модерацию: {url}")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
