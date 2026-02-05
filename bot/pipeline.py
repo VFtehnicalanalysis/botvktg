@@ -152,6 +152,7 @@ class Pipeline:
             elif action == "reject":
                 await self.state.mark_rejected(post_id)
                 await self.state.invalidate_token(token)
+                await self._delete_post_moderation_messages(post_id)
                 if cb_id:
                     await self.tg.answer_callback_query(cb_id, text="Отклонено")
         elif data.startswith("approve_news:") or data.startswith("reject_news:") or data.startswith("news:"):
@@ -185,6 +186,7 @@ class Pipeline:
             if action in {"reject_news", "reject"}:
                 await self.state.mark_news_rejected(url)
                 await self.state.invalidate_news_token(token)
+                await self._delete_news_moderation_messages(url)
                 if cb_id:
                     await self.tg.answer_callback_query(cb_id, text="Отклонено")
                 return
@@ -310,26 +312,39 @@ class Pipeline:
             ]
         }
         parts = chunk_text(full_text, limit=1000)
-        await self.tg.send_message(chat_id=self.config.owner_id, text=parts[0], reply_markup=keyboard)
+        message_ids: List[int] = []
+        first_id = await self.tg.send_message(
+            chat_id=self.config.owner_id, text=parts[0], reply_markup=keyboard
+        )
+        if first_id:
+            message_ids.append(first_id)
         for extra in parts[1:]:
-            await self.tg.send_message(chat_id=self.config.owner_id, text=extra)
+            mid = await self.tg.send_message(chat_id=self.config.owner_id, text=extra)
+            if mid:
+                message_ids.append(mid)
         media: List[Dict[str, Any]] = payload.get("media") or []
         if len(media) == 1:
             m = media[0]
             if m["type"] == "photo":
-                await self.tg.send_photo(chat_id=self.config.owner_id, photo=m["url"])
+                mid = await self.tg.send_photo(chat_id=self.config.owner_id, photo=m["url"])
+                if mid:
+                    message_ids.append(mid)
         elif len(media) > 1:
             group = [{"type": m["type"], "media": m["url"]} for m in media if m.get("url")]
             if group:
-                await self.tg.send_media_group(chat_id=self.config.owner_id, media=group)
+                mids = await self.tg.send_media_group(chat_id=self.config.owner_id, media=group)
+                message_ids.extend(mids)
         poll = payload.get("poll")
         if poll:
-            await self.tg.send_poll(
+            mid = await self.tg.send_poll(
                 chat_id=self.config.owner_id,
                 question=poll["question"],
                 options=poll["options"],
                 is_anonymous=poll.get("is_anonymous", True),
             )
+            if mid:
+                message_ids.append(mid)
+        await self.state.set_moderation_message_ids(post_id, message_ids)
 
     async def _publish(self, post_id: int, payload: Dict[str, Any]) -> None:
         text = payload.get("text", "") or ""
@@ -436,15 +451,26 @@ class Pipeline:
                 ],
             ]
         }
-        await self.tg.send_message(chat_id=self.config.owner_id, text=chunks[0], reply_markup=keyboard)
+        message_ids: List[int] = []
+        first_id = await self.tg.send_message(
+            chat_id=self.config.owner_id, text=chunks[0], reply_markup=keyboard
+        )
+        if first_id:
+            message_ids.append(first_id)
         for extra in chunks[1:]:
-            await self.tg.send_message(chat_id=self.config.owner_id, text=extra)
+            mid = await self.tg.send_message(chat_id=self.config.owner_id, text=extra)
+            if mid:
+                message_ids.append(mid)
         images: List[str] = payload.get("images", [])[:10]
         if len(images) == 1:
-            await self.tg.send_photo(chat_id=self.config.owner_id, photo=images[0])
+            mid = await self.tg.send_photo(chat_id=self.config.owner_id, photo=images[0])
+            if mid:
+                message_ids.append(mid)
         elif len(images) > 1:
             media = [{"type": "photo", "media": img} for img in images]
-            await self._send_media_group_safe(self.config.owner_id, media)
+            mids = await self._send_media_group_safe(self.config.owner_id, media)
+            message_ids.extend(mids)
+        await self.state.set_news_moderation_message_ids(url, message_ids)
 
     async def _publish_news(
         self,
@@ -532,6 +558,22 @@ class Pipeline:
             log.info("[dry-run] VK wall.post: %s", text[:200])
             return None
         return await self.vk.wall_post(message=text, attachments=attachments)
+
+    async def _delete_post_moderation_messages(self, post_id: int) -> None:
+        message_ids = await self.state.get_moderation_message_ids(post_id)
+        if not message_ids:
+            return
+        deleted = await self.tg.delete_messages(self.config.owner_id, message_ids)
+        log.info("Deleted %s/%s post moderation messages for %s", deleted, len(message_ids), post_id)
+        await self.state.clear_moderation_message_ids(post_id)
+
+    async def _delete_news_moderation_messages(self, url: str) -> None:
+        message_ids = await self.state.get_news_moderation_message_ids(url)
+        if not message_ids:
+            return
+        deleted = await self.tg.delete_messages(self.config.owner_id, message_ids)
+        log.info("Deleted %s/%s news moderation messages for %s", deleted, len(message_ids), url)
+        await self.state.clear_news_moderation_message_ids(url)
 
     async def _send_media_group_safe(self, chat_id: int | str, group: List[Dict[str, Any]]) -> List[int]:
         if not group:

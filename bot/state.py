@@ -86,6 +86,7 @@ class StateStore:
                 "status": "pending" if token else "auto",
                 "token": token,
                 "tg_message_ids": [],
+                "moderation_message_ids": [],
                 "updated_at": now,
                 "payload": payload or {},
             }
@@ -143,6 +144,28 @@ class StateStore:
             return None
         return post.get("payload")  # type: ignore
 
+    async def set_moderation_message_ids(self, post_id: int, message_ids: List[int]) -> None:
+        async with self._lock:
+            post = self._data.get("posts", {}).get(str(post_id))
+            if post is not None:
+                post["moderation_message_ids"] = message_ids
+                post["updated_at"] = int(time.time())
+            await self.save()
+
+    async def get_moderation_message_ids(self, post_id: int) -> List[int]:
+        post = self._data.get("posts", {}).get(str(post_id))  # type: ignore
+        if not post:
+            return []
+        return post.get("moderation_message_ids", [])  # type: ignore
+
+    async def clear_moderation_message_ids(self, post_id: int) -> None:
+        async with self._lock:
+            post = self._data.get("posts", {}).get(str(post_id))
+            if post is not None:
+                post["moderation_message_ids"] = []
+                post["updated_at"] = int(time.time())
+            await self.save()
+
     # ---------- News ----------
     async def news_should_skip(self, url: str, content_hash: str) -> bool:
         news = self._data.get("news", {}).get(url)
@@ -174,6 +197,7 @@ class StateStore:
                 "status": "pending" if token else "auto",
                 "token": token,
                 "tg_message_ids": [],
+                "moderation_message_ids": [],
                 "updated_at": now,
                 "payload": payload or {},
             }
@@ -250,6 +274,28 @@ class StateStore:
 
     async def get_news_record(self, url: str) -> Optional[Dict[str, object]]:
         return self._data.get("news", {}).get(url)  # type: ignore
+
+    async def set_news_moderation_message_ids(self, url: str, message_ids: List[int]) -> None:
+        async with self._lock:
+            news = self._data.get("news", {}).get(url)
+            if news is not None:
+                news["moderation_message_ids"] = message_ids
+                news["updated_at"] = int(time.time())
+            await self.save()
+
+    async def get_news_moderation_message_ids(self, url: str) -> List[int]:
+        news = self._data.get("news", {}).get(url)  # type: ignore
+        if not news:
+            return []
+        return news.get("moderation_message_ids", [])  # type: ignore
+
+    async def clear_news_moderation_message_ids(self, url: str) -> None:
+        async with self._lock:
+            news = self._data.get("news", {}).get(url)
+            if news is not None:
+                news["moderation_message_ids"] = []
+                news["updated_at"] = int(time.time())
+            await self.save()
 
     def _append_processed(self, post_id: int) -> None:
         processed: List[int] = self._data.setdefault("processed_ids", [])  # type: ignore

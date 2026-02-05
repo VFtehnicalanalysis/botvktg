@@ -177,16 +177,24 @@ class SiteClient:
         parser.feed(content_html)
         text = self._clean_text(parser.text(), title, is_digest=is_digest)
         # изображения: только с нашего домена, допустимые расширения или raw.php
-        imgs = re.findall(r'<img[^>]+src="([^"]+)"', content_html)
         images: List[str] = []
-        for src in imgs:
-            if not self._is_candidate_image(src):
-                continue
-            images.append(_abs_url(self.config.site_base_url, src))
-        raws = re.findall(r'href="([^"]+raw\.php[^"]*)"', content_html)
-        for r in raws:
-            if self._is_candidate_image(r):
-                images.append(_abs_url(self.config.site_base_url, r))
+        icon_images: List[str] = []
+        if is_digest:
+            icon_images = self._extract_aef_news_icon_images(content_html)
+            if not icon_images:
+                icon_images = self._extract_aef_news_icon_images(html)
+        if is_digest and icon_images:
+            images.extend(icon_images[:3])
+        else:
+            imgs = re.findall(r'<img[^>]+src="([^"]+)"', content_html)
+            for src in imgs:
+                if not self._is_candidate_image(src):
+                    continue
+                images.append(_abs_url(self.config.site_base_url, src))
+            raws = re.findall(r'href="([^"]+raw\.php[^"]*)"', content_html)
+            for r in raws:
+                if self._is_candidate_image(r):
+                    images.append(_abs_url(self.config.site_base_url, r))
         # уникализируем и фильтруем запросом (до 10 валидных)
         seen = set()
         uniq_images: List[str] = []
@@ -248,6 +256,22 @@ class SiteClient:
                 return m.group(1)
         return html
 
+    def _extract_aef_news_icon_images(self, html: str) -> List[str]:
+        urls: List[str] = []
+        matches = re.findall(
+            r'class="aef_news_icon"[^>]*style="[^"]*background-image:\s*url\(([^)]+)\)',
+            html,
+            re.I,
+        )
+        for raw_url in matches:
+            cleaned = raw_url.strip().strip("'\"")
+            if not cleaned:
+                continue
+            if not self._is_candidate_image(cleaned):
+                continue
+            urls.append(_abs_url(self.config.site_base_url, cleaned))
+        return urls
+
     def _is_digest(self, title: Optional[str]) -> bool:
         if not title:
             return False
@@ -269,6 +293,17 @@ class SiteClient:
             "алumni анкетирование на выпуске выпускники",
             "фурасов владислав дмитриевич",
         }
+        footer_markers = (
+            "brics journal of economics",
+            "population and economics",
+            "© 1996-2026 экономический факультет мгу имени м.в.ломоносова",
+            "внимание! при использовании материалов",
+            "соглашение об обработке персональных данных",
+            "consent to process personal data",
+            "постоянный адрес этой страницы",
+            "powered by dynacont",
+            "on.econ",
+        )
         digest_skip = {
             "юбилейные встречи выпускников",
             "организовать встречу выпуска",
@@ -283,6 +318,8 @@ class SiteClient:
             if not ln:
                 continue
             ln_norm = ln.replace("\xa0", " ").strip().lower()
+            if any(marker in ln_norm for marker in footer_markers):
+                break
             if ln_norm in stop_phrases or (title_norm and ln_norm == title_norm):
                 continue
             if is_digest and any(skip in ln_norm for skip in digest_skip):

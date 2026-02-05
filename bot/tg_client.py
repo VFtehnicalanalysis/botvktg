@@ -127,6 +127,21 @@ class TelegramClient:
             return
         await self._request("answerCallbackQuery", payload)
 
+    async def delete_message(self, chat_id: int | str, message_id: int) -> bool:
+        payload: Dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
+        if self.config.dry_run:
+            log.info("[dry-run] deleteMessage in %s: %s", chat_id, message_id)
+            return True
+        data = await self._request("deleteMessage", payload)
+        return bool(data.get("ok"))
+
+    async def delete_messages(self, chat_id: int | str, message_ids: Sequence[int]) -> int:
+        deleted = 0
+        for message_id in message_ids:
+            if await self.delete_message(chat_id=chat_id, message_id=message_id):
+                deleted += 1
+        return deleted
+
     async def get_updates(
         self,
         offset: Optional[int] = None,
