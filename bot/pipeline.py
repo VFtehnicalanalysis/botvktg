@@ -102,6 +102,7 @@ class Pipeline:
         existing = await self.state.get_post_record(post_id) or {}
         existing_hash = existing.get("hash")
         status = existing.get("status")
+        already_published = str(status).startswith("published")
         if not force and existing_hash == content_hash:
             log.info("Skip post %s (duplicate hash)", post_id)
             return
@@ -115,7 +116,15 @@ class Pipeline:
         await self.state.mark_pending(post_id, content_hash, token, payload=normalized)
         self.pending_cache[post_id] = normalized
         if self.config.moderation_required:
-            await self._send_for_moderation(post_id, normalized, token)
+            use_extended_actions = not (force and source == "manual-refresh")
+            warn_duplicate = force and source == "manual-refresh" and already_published
+            await self._send_for_moderation(
+                post_id,
+                normalized,
+                token,
+                use_extended_actions=use_extended_actions,
+                warn_duplicate=warn_duplicate,
+            )
         else:
             await self._publish(post_id, normalized)
 
@@ -127,7 +136,49 @@ class Pipeline:
         cb_id = cb.get("id")
         from_user = cb.get("from", {})
         user_id = from_user.get("id")
-        if data.startswith("approve:") or data.startswith("reject:"):
+        if data.startswith("post:"):
+            if user_id != self.config.owner_id:
+                if cb_id:
+                    await self.tg.answer_callback_query(cb_id, text="Нет доступа")
+                return
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                if cb_id:
+                    await self.tg.answer_callback_query(cb_id, text="Неверная команда")
+                return
+            _, action, token = parts
+            post_id = await self.state.get_post_by_token(token)
+            if post_id is None:
+                if cb_id:
+                    await self.tg.answer_callback_query(cb_id, text="Устарело")
+                return
+            payload = self.pending_cache.get(post_id) or await self.state.get_payload(post_id)
+            if not payload:
+                if cb_id:
+                    await self.tg.answer_callback_query(cb_id, text="Нет данных")
+                return
+            valid_actions = {"vk", "tg", "both", "reject"}
+            if action not in valid_actions:
+                if cb_id:
+                    await self.tg.answer_callback_query(cb_id, text="Неизвестная команда")
+                return
+            if action == "reject":
+                await self.state.mark_rejected(post_id)
+                await self.state.invalidate_token(token)
+                await self._delete_post_moderation_messages(post_id)
+                if cb_id:
+                    await self.tg.answer_callback_query(cb_id, text="Отклонено")
+                return
+            await self.state.mark_approved(post_id)
+            await self.state.invalidate_token(token)
+            if action in {"tg", "both"}:
+                await self._publish(post_id, payload)
+                if cb_id:
+                    await self.tg.answer_callback_query(cb_id, text="Опубликовано в TG")
+            else:
+                if cb_id:
+                    await self.tg.answer_callback_query(cb_id, text="Оставлено только в ВК")
+        elif data.startswith("approve:") or data.startswith("reject:"):
             if user_id != self.config.owner_id:
                 if cb_id:
                     await self.tg.answer_callback_query(cb_id, text="Нет доступа")
@@ -297,20 +348,43 @@ class Pipeline:
             return
         await self.handle_news(latest, force=force)
 
-    async def _send_for_moderation(self, post_id: int, payload: Dict[str, Any], token: Optional[str]) -> None:
+    async def _send_for_moderation(
+        self,
+        post_id: int,
+        payload: Dict[str, Any],
+        token: Optional[str],
+        use_extended_actions: bool = True,
+        warn_duplicate: bool = False,
+    ) -> None:
         log.info("Post %s pending moderation", post_id)
         text = escape_html(payload["text"]) if payload["text"] else "(без текста)"
         vk_link = escape_html(payload.get("vk_url", ""))
         header = f"Новый пост #{post_id} из ВК:\n{vk_link}"
+        if warn_duplicate:
+            header = f"{header}\n⚠️ Найден дубликат, уверены ли вы, что хотите продолжить?"
         full_text = f"{header}\n\n{text}" if text else header
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Опубликовать в TG", "callback_data": f"approve:{token}"},
-                    {"text": "🚫 Отклонить", "callback_data": f"reject:{token}"},
+        if use_extended_actions:
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "📢 ВК", "callback_data": f"post:vk:{token}"},
+                        {"text": "✈️ TG", "callback_data": f"post:tg:{token}"},
+                    ],
+                    [
+                        {"text": "📢+✈️ ВК+TG", "callback_data": f"post:both:{token}"},
+                        {"text": "🚫 Отклонить", "callback_data": f"post:reject:{token}"},
+                    ],
                 ]
-            ]
-        }
+            }
+        else:
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {"text": "✅ Опубликовать в TG", "callback_data": f"approve:{token}"},
+                        {"text": "🚫 Отклонить", "callback_data": f"reject:{token}"},
+                    ]
+                ]
+            }
         parts = chunk_text(full_text, limit=1000)
         message_ids: List[int] = []
         first_id = await self.tg.send_message(
@@ -429,6 +503,8 @@ class Pipeline:
             "text": detail.get("text", ""),
             "images": detail.get("images", []),
         }
+        if detail.get("is_digest") or "/digest/" in url.lower():
+            payload["images"] = payload.get("images", [])[:1]
         content_hash = self._hash_payload(payload)
         if not force and await self.state.news_should_skip(url, content_hash):
             log.info("Skip news (hash): %s", url)

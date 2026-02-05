@@ -192,15 +192,22 @@ class SiteClient:
             icon_images = self._extract_aef_news_icon_images(content_html)
             if not icon_images:
                 icon_images = self._extract_aef_news_icon_images(html)
-        if is_digest and icon_images:
-            images.extend(icon_images[:3])
-        else:
+        if is_digest:
+            if icon_images:
+                images.extend(icon_images[:3])
+            else:
+                raw_images = self._extract_raw_images(content_html, only_image_param=True)
+                if not raw_images:
+                    raw_images = self._extract_raw_images(html, only_image_param=True)
+                if raw_images:
+                    images.extend(raw_images)
+        if not images:
             imgs = re.findall(r'<img[^>]+src="([^"]+)"', content_html)
             for src in imgs:
                 if not self._is_candidate_image(src):
                     continue
                 images.append(_abs_url(self.config.site_base_url, src))
-            raws = re.findall(r'href="([^"]+raw\.php[^"]*)"', content_html)
+            raws = self._extract_raw_images(content_html, only_image_param=False)
             for r in raws:
                 if self._is_candidate_image(r):
                     images.append(_abs_url(self.config.site_base_url, r))
@@ -286,6 +293,14 @@ class SiteClient:
             urls.append(_abs_url(self.config.site_base_url, cleaned))
         return urls
 
+    def _extract_raw_images(self, html: str, only_image_param: bool) -> List[str]:
+        urls: List[str] = []
+        for raw in re.findall(r'(?:href|src)="([^"]+raw\.php[^"]*)"', html, re.I):
+            if only_image_param and "p=image" not in raw.lower():
+                continue
+            urls.append(_abs_url(self.config.site_base_url, raw))
+        return urls
+
     def _is_digest(self, title: Optional[str], url: Optional[str] = None) -> bool:
         title_l = (title or "").lower()
         url_l = (url or "").lower()
@@ -329,6 +344,7 @@ class SiteClient:
                 text,
                 flags=re.S | re.I,
             )
+        text = text.replace("\xa0", " ")
         lines = [ln.strip() for ln in text.splitlines()]
         cleaned: List[str] = []
         title_norm = (title or "").replace("\xa0", " ").strip().lower()
@@ -338,8 +354,17 @@ class SiteClient:
             "фурасов владислав дмитриевич",
         }
         footer_markers = (
+            "электронный журнал brics journal of economics",
             "brics journal of economics",
             "population and economics",
+            "архив препринтов",
+            "книги экономического факультета",
+            "институциональная подписка",
+            "материалы курсов",
+            "личный кабинет",
+            "интернет ресурсы",
+            "обратная связь",
+            "карта сайта",
             "© 1996-2026 экономический факультет мгу имени м.в.ломоносова",
             "внимание! при использовании материалов",
             "соглашение об обработке персональных данных",
@@ -348,6 +373,15 @@ class SiteClient:
             "powered by dynacont",
             "on.econ",
         )
+        lower_text = text.lower()
+        cut_idx = None
+        for marker in footer_markers:
+            idx = lower_text.find(marker)
+            if idx != -1 and (cut_idx is None or idx < cut_idx):
+                cut_idx = idx
+        if cut_idx is not None:
+            text = text[:cut_idx]
+            lines = [ln.strip() for ln in text.splitlines()]
         digest_skip = {
             "юбилейные встречи выпускников",
             "организовать встречу выпуска",
@@ -362,6 +396,8 @@ class SiteClient:
             if not ln:
                 continue
             ln_norm = ln.replace("\xa0", " ").strip().lower()
+            if ln_norm in {"ресурсы", "ресурсы:"}:
+                break
             if any(marker in ln_norm for marker in footer_markers):
                 break
             if ln_norm in stop_phrases or (title_norm and ln_norm == title_norm):
