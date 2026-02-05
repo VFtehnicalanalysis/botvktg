@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -53,15 +54,69 @@ def normalize_vk_markup(text: str) -> str:
     return re.sub(r"\[([^|\]]+)\|([^|\]]+)(?:\|([^\]]+))?\]", repl, text)
 
 
-def chunk_text(text: str, limit: int = 3500) -> List[str]:
+def _split_block_by_words(text: str, limit: int) -> List[str]:
+    if not text:
+        return []
     if len(text) <= limit:
         return [text]
+    tokens = re.findall(r"\S+|\s+", text)
     parts: List[str] = []
-    start = 0
-    while start < len(text):
-        parts.append(text[start : start + limit])
-        start += limit
+    current = ""
+    for token in tokens:
+        if len(token) > limit:
+            if current.strip():
+                parts.append(current.rstrip())
+                current = ""
+            start = 0
+            while start < len(token):
+                piece = token[start : start + limit]
+                if len(piece) == limit:
+                    parts.append(piece.rstrip())
+                else:
+                    current = piece
+                start += limit
+            continue
+        if len(current) + len(token) <= limit:
+            current += token
+            continue
+        if current.strip():
+            parts.append(current.rstrip())
+        current = token.lstrip() if token.isspace() else token
+    if current.strip():
+        parts.append(current.rstrip())
     return parts
+
+
+def chunk_text(text: str, limit: int = 3500) -> List[str]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return [""]
+    if len(cleaned) <= limit:
+        return [cleaned]
+    paragraphs = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return _split_block_by_words(cleaned, limit)
+    chunks: List[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        candidate = paragraph if not current else f"{current}\n\n{paragraph}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(paragraph) <= limit:
+            current = paragraph
+            continue
+        paragraph_parts = _split_block_by_words(paragraph, limit)
+        if not paragraph_parts:
+            continue
+        chunks.extend(paragraph_parts[:-1])
+        current = paragraph_parts[-1]
+    if current:
+        chunks.append(current)
+    return chunks or [cleaned]
 
 
 class Pipeline:
@@ -282,7 +337,7 @@ class Pipeline:
             if action in {"reject_news", "reject"}:
                 await self.state.mark_news_rejected(url)
                 await self.state.invalidate_news_token(token)
-                await self._delete_news_moderation_messages(url)
+                await self._delete_news_moderation_messages(url, payload=payload)
                 await self._notify_news_result(
                     published=False,
                     source_link=url,
@@ -307,7 +362,7 @@ class Pipeline:
                 publish_tg=publish_tg,
                 notify_owner=False,
             )
-            await self._delete_news_moderation_messages(url)
+            await self._delete_news_moderation_messages(url, payload=payload)
             await self._notify_news_result(
                 published=True,
                 source_link=url,
@@ -419,6 +474,17 @@ class Pipeline:
             return text[:idx].rstrip()
         return text.strip()
 
+    def _news_url_variants(self, url: str) -> List[str]:
+        base = (url or "").strip()
+        if not base:
+            return []
+        variants = {base}
+        if base.endswith("/"):
+            variants.add(base.rstrip("/"))
+        else:
+            variants.add(f"{base}/")
+        return [v for v in variants if v]
+
     def _normalize_message_ids(self, raw_value: Any) -> List[int]:
         if not isinstance(raw_value, list):
             return []
@@ -439,12 +505,30 @@ class Pipeline:
         if not chunks:
             return None, []
         first = chunks[0] or ""
-        caption = first[:caption_limit] if first else ""
-        tail = first[caption_limit:]
-        extras = [part for part in chunks[1:] if part]
-        if tail:
-            extras.insert(0, tail)
+        first_parts = chunk_text(first, limit=caption_limit) if first else []
+        if not first_parts:
+            first_parts = [""]
+        caption = first_parts[0]
+        extras = [part for part in first_parts[1:] if part]
+        extras.extend([part for part in chunks[1:] if part])
         return (caption or None), extras
+
+    def _render_digest_more_links(self, text: str, html: bool) -> str:
+        if not text:
+            return ""
+
+        def repl(match: re.Match[str]) -> str:
+            url = (match.group(1) or "").strip()
+            if not url:
+                return ""
+            if html:
+                return f'<a href="{escape_html(url)}">&gt;&gt;</a>'
+            return f">> {url}"
+
+        rendered = re.sub(r"\[\[MORE:([^\]]+)\]\]", repl, text)
+        rendered = re.sub(r"[ \t]+\n", "\n", rendered)
+        rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+        return rendered.strip()
 
     def _format_news_text(
         self, payload: Dict[str, Any], html: bool = True, include_body: bool = True
@@ -458,6 +542,8 @@ class Pipeline:
             date = escape_html(date)
             link = escape_html(link)
             text_body = escape_html(text_body)
+        else:
+            text_body = self._render_digest_more_links(text_body, html=False)
         lines: List[str] = []
         if title:
             lines.append(title)
@@ -634,16 +720,7 @@ class Pipeline:
         url = news["url"]
         existing = await self.state.get_news_record(url)
         if force and existing:
-            stale_ids = self._normalize_message_ids(existing.get("moderation_message_ids"))
-            if stale_ids:
-                deleted = await self.tg.delete_messages(self.config.owner_id, stale_ids)
-                log.info(
-                    "Deleted stale %s/%s news moderation messages before re-send for %s",
-                    deleted,
-                    len(stale_ids),
-                    url,
-                )
-                await self.state.clear_news_moderation_message_ids(url)
+            await self._delete_news_moderation_messages(url, payload=existing.get("payload"))
         if existing and not force:
             status = existing.get("status")
             if status in {"approved", "pending", "rejected"} or str(status).startswith("published"):
@@ -714,13 +791,15 @@ class Pipeline:
             ]
         }
         message_ids: List[int] = []
+        first_text = self._render_digest_more_links(chunks[0], html=True)
         first_id = await self.tg.send_message(
-            chat_id=self.config.owner_id, text=chunks[0], reply_markup=keyboard
+            chat_id=self.config.owner_id, text=first_text, reply_markup=keyboard
         )
         if first_id:
             message_ids.append(first_id)
         for extra in chunks[1:]:
-            mid = await self.tg.send_message(chat_id=self.config.owner_id, text=extra)
+            extra_text = self._render_digest_more_links(extra, html=True)
+            mid = await self.tg.send_message(chat_id=self.config.owner_id, text=extra_text)
             if mid:
                 message_ids.append(mid)
         all_images: List[str] = payload.get("images", []) or []
@@ -780,35 +859,40 @@ class Pipeline:
         if images:
             if len(images) == 1:
                 caption, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
+                rendered_caption = self._render_digest_more_links(caption or "", html=True) or None
                 mid = await self.tg.send_photo(
                     chat_id=self.config.tg_channel_id,
                     photo=images[0],
-                    caption=caption,
+                    caption=rendered_caption,
                 )
                 if mid:
                     message_ids.append(mid)
                 for extra in extra_chunks:
-                    mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra)
+                    extra_text = self._render_digest_more_links(extra, html=True)
+                    mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra_text)
                     if mid:
                         message_ids.append(mid)
             else:
                 caption, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
+                rendered_caption = self._render_digest_more_links(caption or "", html=True) or None
                 group = []
                 for idx, img in enumerate(images):
                     entry = {"type": "photo", "media": img}
-                    if idx == 0 and caption:
-                        entry["caption"] = caption
+                    if idx == 0 and rendered_caption:
+                        entry["caption"] = rendered_caption
                         entry["parse_mode"] = "HTML"
                     group.append(entry)
                 mids = await self._send_media_group_safe(self.config.tg_channel_id, group)
                 message_ids.extend(mids)
                 for extra in extra_chunks:
-                    mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra)
+                    extra_text = self._render_digest_more_links(extra, html=True)
+                    mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra_text)
                     if mid:
                         message_ids.append(mid)
         else:
             for part in chunks:
-                mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=part)
+                part_text = self._render_digest_more_links(part, html=True)
+                mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=part_text)
                 if mid:
                     message_ids.append(mid)
         return message_ids
@@ -918,13 +1002,41 @@ class Pipeline:
         log.info("Deleted %s/%s post moderation messages for %s", deleted, len(message_ids), post_id)
         await self.state.clear_moderation_message_ids(post_id)
 
-    async def _delete_news_moderation_messages(self, url: str) -> None:
-        message_ids = await self.state.get_news_moderation_message_ids(url)
-        if not message_ids:
+    async def _delete_news_moderation_messages(
+        self,
+        url: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        alias_urls = set(self._news_url_variants(url))
+        payload_url = str((payload or {}).get("url") or "")
+        if payload_url:
+            alias_urls.update(self._news_url_variants(payload_url))
+
+        all_ids: List[int] = []
+        urls_with_ids: List[str] = []
+        for alias in alias_urls:
+            message_ids = await self.state.get_news_moderation_message_ids(alias)
+            normalized = self._normalize_message_ids(message_ids)
+            if normalized:
+                all_ids.extend(normalized)
+                urls_with_ids.append(alias)
+
+        unique_ids = sorted(set(all_ids))
+        if not unique_ids and not urls_with_ids:
             return
-        deleted = await self.tg.delete_messages(self.config.owner_id, message_ids)
-        log.info("Deleted %s/%s news moderation messages for %s", deleted, len(message_ids), url)
-        await self.state.clear_news_moderation_message_ids(url)
+
+        deleted = 0
+        if unique_ids:
+            deleted = await self.tg.delete_messages(self.config.owner_id, unique_ids)
+        for alias in urls_with_ids:
+            await self.state.clear_news_moderation_message_ids(alias)
+        log.info(
+            "Deleted %s/%s news moderation messages for %s (aliases=%s)",
+            deleted,
+            len(unique_ids),
+            url,
+            ",".join(sorted(urls_with_ids)),
+        )
 
     async def _send_media_group_safe(self, chat_id: int | str, group: List[Dict[str, Any]]) -> List[int]:
         if not group:

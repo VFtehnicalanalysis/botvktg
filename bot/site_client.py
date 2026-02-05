@@ -209,12 +209,13 @@ class SiteClient:
         html = unescape(resp.text)
         final_url = str(resp.url)
         content_html = self._extract_main_block(html)
+        content_for_text = self._inject_digest_more_markers(content_html)
         extracted_title = title or self._extract_title(content_html, html)
         extracted_date = self._extract_date(content_html, html)
         # текст
         is_digest = self._is_digest(extracted_title, url=final_url or url) or self._looks_like_digest_page(html)
         parser = TextExtractor()
-        parser.feed(content_html)
+        parser.feed(content_for_text)
         raw_text = parser.text()
         if not is_digest and self._looks_like_digest_text(raw_text, html):
             is_digest = True
@@ -361,6 +362,26 @@ class SiteClient:
                 continue
             urls.append(_abs_url(self.config.site_base_url, raw))
         return urls
+
+    def _inject_digest_more_markers(self, html: str) -> str:
+        """
+        В дайджесте ссылки "Читать далее" часто заданы картинкой (<a class="digest__more"><img ...>).
+        Добавляем текстовый маркер, чтобы ссылка попала в текст публикации в корректном порядке.
+        """
+        pattern = re.compile(
+            r'<a\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\bdigest__more\b[^"\']*["\'])'
+            r'(?=[^>]*\bhref\s*=\s*["\']([^"\']+)["\'])[^>]*>\s*(?:<img\b[^>]*>\s*)*</a>',
+            re.I | re.S,
+        )
+
+        def repl(match: re.Match[str]) -> str:
+            href = (match.group(1) or "").strip()
+            if not href:
+                return ""
+            full_href = _abs_url(self.config.site_base_url, href)
+            return f"\n[[MORE:{full_href}]]\n"
+
+        return pattern.sub(repl, html)
 
     def _is_digest(self, title: Optional[str], url: Optional[str] = None) -> bool:
         title_l = (title or "").lower()
