@@ -9,7 +9,8 @@ from typing import Dict, Optional
 @dataclass
 class Config:
     vk_group_id: int
-    vk_token: str
+    vk_token: str  # group token
+    vk_user_token: str  # user token for read/upload methods unavailable for group token
     tg_bot_token: str
     tg_channel_id: str
     owner_id: int
@@ -57,6 +58,7 @@ def load_config(password_file: Path = Path("password"), dry_run: bool = False) -
 
     vk_group_id = int(get("VK_GROUP_ID", "0"))
     vk_token = get("VK_GROUP_TOKEN", "")
+    vk_user_token = get("VK_USER_TOKEN", "")
     tg_bot_token = get("TG_BOT_TOKEN", "")
     tg_channel_id = get("TG_CHANNEL_ID", "")
     owner_id = int(get("OWNER_ID", "0"))
@@ -66,6 +68,7 @@ def load_config(password_file: Path = Path("password"), dry_run: bool = False) -
     return Config(
         vk_group_id=vk_group_id,
         vk_token=vk_token,
+        vk_user_token=vk_user_token,
         tg_bot_token=tg_bot_token,
         tg_channel_id=tg_channel_id,
         owner_id=owner_id,

@@ -80,7 +80,12 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                         if cb.get("id"):
                             await tg.answer_callback_query(cb["id"], text="Обновление запущено")
                         if tg.config.source_mode in ("vk", "vk+site"):
-                            await pipeline.refresh_recent_posts(vk)
+                            vk_count = await pipeline.refresh_recent_posts(vk)
+                            if vk_count == 0:
+                                await tg.notify_owner(
+                                    "Ручное обновление VK не вернуло посты. "
+                                    "Используется авто-поток VK (LongPoll)."
+                                )
                         if tg.config.source_mode in ("site", "vk+site"):
                             await pipeline.refresh_latest_news()
                         await tg.notify_owner("Ручное обновление завершено (без дублей).")
@@ -88,12 +93,22 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                         if cb.get("id"):
                             await tg.answer_callback_query(cb["id"], text="Берем крайний пост VK")
                         if tg.config.source_mode in ("vk", "vk+site"):
-                            await pipeline.refresh_recent_posts(vk, count=1, force=True)
+                            vk_count = await pipeline.refresh_recent_posts(vk, count=1, force=True)
+                            if vk_count == 0:
+                                await tg.notify_owner(
+                                    "Не удалось получить крайний пост VK из кеша авто-потока."
+                                )
                     elif data == "latest_site" and user_id == tg.config.owner_id:
                         if cb.get("id"):
                             await tg.answer_callback_query(cb["id"], text="Берем крайнюю новость сайта")
                         if tg.config.source_mode in ("site", "vk+site"):
                             await pipeline.refresh_latest_news(force=True)
+                    elif data == "news_by_link" and user_id == tg.config.owner_id:
+                        if cb.get("id"):
+                            await tg.answer_callback_query(cb["id"], text="Пришлите ссылку в чат")
+                        await tg.notify_owner(
+                            "Пришлите ссылку на новость/дайджест с сайта одним сообщением."
+                        )
                     else:
                         await pipeline.handle_callback(upd)
                 elif "message" in upd:
@@ -104,7 +119,12 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                         lowered = text.strip().lower()
                         if lowered in {"/refresh", "обновить посты"}:
                             if tg.config.source_mode in ("vk", "vk+site"):
-                                await pipeline.refresh_recent_posts(vk)
+                                vk_count = await pipeline.refresh_recent_posts(vk)
+                                if vk_count == 0:
+                                    await tg.notify_owner(
+                                        "Ручное обновление VK не вернуло посты. "
+                                        "Используется авто-поток VK (LongPoll)."
+                                    )
                             if tg.config.source_mode in ("site", "vk+site"):
                                 await pipeline.refresh_latest_news()
                             await tg.notify_owner("Ручное обновление завершено (без дублей).")
@@ -138,6 +158,7 @@ async def run(dry_run: bool = False) -> None:
                 [{"text": "🔄 Обновить посты", "callback_data": "refresh_posts"}],
                 [{"text": "📌 Крайний пост VK", "callback_data": "latest_vk"}],
                 [{"text": "📰 Крайняя новость сайта", "callback_data": "latest_site"}],
+                [{"text": "🔗 Новость по ссылке", "callback_data": "news_by_link"}],
             ]
         }
         await tg.send_message(

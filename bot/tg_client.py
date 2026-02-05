@@ -40,8 +40,14 @@ class TelegramClient:
         text: str,
         parse_mode: str = "HTML",
         reply_markup: Optional[Dict[str, Any]] = None,
+        disable_web_page_preview: bool = True,
     ) -> Optional[int]:
-        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": disable_web_page_preview,
+        }
         if reply_markup:
             payload["reply_markup"] = reply_markup
         if self.config.dry_run:

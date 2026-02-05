@@ -119,6 +119,105 @@ def chunk_text(text: str, limit: int = 3500) -> List[str]:
     return chunks or [cleaned]
 
 
+def _split_block_with_more_markers(text: str, limit: int) -> List[str]:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return []
+    atoms: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.fullmatch(r"\[\[MORE:[^\]]+\]\]", line):
+            if atoms:
+                atoms[-1] = f"{atoms[-1]}\n{line}"
+            else:
+                atoms.append(line)
+            i += 1
+            continue
+        atom = line
+        i += 1
+        while i < len(lines) and re.fullmatch(r"\[\[MORE:[^\]]+\]\]", lines[i]):
+            atom = f"{atom}\n{lines[i]}"
+            i += 1
+        atoms.append(atom)
+
+    parts: List[str] = []
+    current = ""
+    for atom in atoms:
+        candidate = atom if not current else f"{current}\n{atom}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+            current = ""
+        if len(atom) <= limit:
+            current = atom
+            continue
+        split_atom = _split_block_by_words(atom, limit)
+        if not split_atom:
+            continue
+        parts.extend(split_atom[:-1])
+        current = split_atom[-1]
+    if current:
+        parts.append(current)
+    return parts
+
+
+def chunk_text_preserving_more_markers(text: str, limit: int = 3500) -> List[str]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return [""]
+    if "[[MORE:" not in cleaned:
+        return chunk_text(cleaned, limit=limit)
+
+    pair_re = re.compile(r"(?s)(.*?)(\[\[MORE:[^\]]+\]\])")
+    blocks: List[str] = []
+    pos = 0
+    for match in pair_re.finditer(cleaned):
+        before = (match.group(1) or "").strip()
+        marker = (match.group(2) or "").strip()
+        if before:
+            blocks.append(f"{before}\n{marker}")
+        elif marker:
+            if blocks:
+                blocks[-1] = f"{blocks[-1]}\n{marker}"
+            else:
+                blocks.append(marker)
+        pos = match.end()
+    tail = cleaned[pos:].strip()
+    if tail:
+        blocks.append(tail)
+    if not blocks:
+        return chunk_text(cleaned, limit=limit)
+
+    chunks: List[str] = []
+    current = ""
+    for block in blocks:
+        candidate = block if not current else f"{current}\n\n{block}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(block) <= limit:
+            current = block
+            continue
+        split_block = (
+            _split_block_with_more_markers(block, limit)
+            if "[[MORE:" in block
+            else _split_block_by_words(block, limit)
+        )
+        if not split_block:
+            continue
+        chunks.extend(split_block[:-1])
+        current = split_block[-1]
+    if current:
+        chunks.append(current)
+    return chunks or [cleaned]
+
+
 class Pipeline:
     def __init__(
         self,
@@ -380,44 +479,160 @@ class Pipeline:
         owner_id = post.get("owner_id") or 0
         post_id = post.get("id") or post.get("post_id") or 0
         vk_url = f"https://vk.com/wall{owner_id}_{post_id}"
-        attachments = post.get("attachments", []) or []
         parsed_media: List[Dict[str, Any]] = []
         extra_lines: List[str] = []
         poll_obj: Optional[Dict[str, Any]] = None
 
-        for att in attachments:
-            att_type = att.get("type")
-            if att_type == "photo":
-                photo = att.get("photo") or {}
-                sizes = photo.get("sizes") or []
-                if sizes:
-                    best = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
-                    parsed_media.append({"type": "photo", "url": best.get("url")})
-            elif att_type == "video":
-                video = att.get("video") or {}
-                video_link = f"https://vk.com/video{video.get('owner_id')}_{video.get('id')}"
-                extra_lines.append(f"Видео: {video_link}")
-            elif att_type == "poll":
-                poll = att.get("poll") or {}
-                poll_obj = {
-                    "question": poll.get("question", "")[:255],
-                    "options": [ans.get("text", "")[:255] for ans in poll.get("answers", [])],
-                    "is_anonymous": poll.get("anonymous", True),
-                }
-            else:
-                link = att.get(att_type, {}).get("url")
-                title = att.get(att_type, {}).get("title") or att_type
-                if link:
-                    extra_lines.append(f"{title}: {link}")
+        def _extract_best_photo_url(photo_obj: Any) -> Optional[str]:
+            if not isinstance(photo_obj, dict):
+                return None
+            best_url: Optional[str] = None
+            best_score = -1
 
-        if post.get("copy_history"):
-            src = post["copy_history"][0]
+            sizes = photo_obj.get("sizes") or []
+            if isinstance(sizes, list):
+                size_type_rank = {
+                    "w": 12,
+                    "z": 11,
+                    "y": 10,
+                    "x": 9,
+                    "r": 8,
+                    "q": 7,
+                    "p": 6,
+                    "o": 5,
+                    "m": 4,
+                    "s": 3,
+                }
+                for size in sizes:
+                    if not isinstance(size, dict):
+                        continue
+                    url = str(size.get("url") or size.get("src") or "").strip()
+                    if not url:
+                        continue
+                    width = int(size.get("width") or 0)
+                    height = int(size.get("height") or 0)
+                    score = width * height
+                    if score <= 0:
+                        score = size_type_rank.get(str(size.get("type") or "").lower(), 0)
+                    if score > best_score:
+                        best_score = score
+                        best_url = url
+
+            orig_photo = photo_obj.get("orig_photo")
+            if isinstance(orig_photo, dict):
+                url = str(orig_photo.get("url") or "").strip()
+                if url:
+                    width = int(orig_photo.get("width") or 0)
+                    height = int(orig_photo.get("height") or 0)
+                    score = width * height if width and height else 10_000_000
+                    if score > best_score:
+                        best_score = score
+                        best_url = url
+
+            flat_key_rank = {
+                "src_xxbig": 9_500_000,
+                "src_xbig": 9_400_000,
+                "src_big": 9_300_000,
+                "src": 9_200_000,
+                "url": 9_100_000,
+            }
+            for key, score in flat_key_rank.items():
+                url = str(photo_obj.get(key) or "").strip()
+                if url and score > best_score:
+                    best_score = score
+                    best_url = url
+
+            for key, value in photo_obj.items():
+                if not isinstance(value, str):
+                    continue
+                url = value.strip()
+                if not url:
+                    continue
+                match = re.fullmatch(r"photo_(\d+)", str(key))
+                if not match:
+                    continue
+                score = int(match.group(1))
+                if score > best_score:
+                    best_score = score
+                    best_url = url
+
+            return best_url
+
+        def _append_photo(photo_obj: Any) -> None:
+            best_url = _extract_best_photo_url(photo_obj)
+            if not best_url:
+                return
+            if any(item.get("url") == best_url for item in parsed_media):
+                return
+            parsed_media.append({"type": "photo", "url": best_url})
+
+        def _parse_attachments(raw_attachments: Any) -> None:
+            nonlocal poll_obj
+            for att in (raw_attachments or []):
+                if not isinstance(att, dict):
+                    continue
+                att_type = att.get("type")
+                if att_type == "photo":
+                    _append_photo(att.get("photo") or {})
+                    continue
+                if att_type == "video":
+                    video = att.get("video") or {}
+                    if video.get("owner_id") is not None and video.get("id") is not None:
+                        video_link = f"https://vk.com/video{video.get('owner_id')}_{video.get('id')}"
+                        extra_lines.append(f"Видео: {video_link}")
+                    continue
+                if att_type == "link":
+                    link_obj = att.get("link") or {}
+                    _append_photo(link_obj.get("photo") or {})
+                    link_url = link_obj.get("url")
+                    if link_url:
+                        extra_lines.append(f"Ссылка: {link_url}")
+                    continue
+                if att_type == "posted_photo":
+                    _append_photo(att.get("posted_photo") or att)
+                    continue
+                if att_type == "doc":
+                    doc = att.get("doc") or {}
+                    preview_photo = ((doc.get("preview") or {}).get("photo") or {})
+                    _append_photo(preview_photo)
+                    doc_url = doc.get("url")
+                    if doc_url:
+                        extra_lines.append(f"Документ: {doc_url}")
+                    continue
+                if att_type == "poll":
+                    poll = att.get("poll") or {}
+                    poll_obj = {
+                        "question": poll.get("question", "")[:255],
+                        "options": [ans.get("text", "")[:255] for ans in poll.get("answers", [])],
+                        "is_anonymous": poll.get("anonymous", True),
+                    }
+                    continue
+                link = att.get(att_type, {}).get("url") if att_type else None
+                title = att.get(att_type, {}).get("title") if att_type else None
+                if link:
+                    extra_lines.append(f"{title or att_type}: {link}")
+
+        _parse_attachments(post.get("attachments", []) or [])
+
+        for idx, src in enumerate(post.get("copy_history", []) or []):
+            if not isinstance(src, dict):
+                continue
             src_text = src.get("text") or ""
             if src_text:
-                text = f"{text}\n\n[Перепост]:\n{src_text}"
+                prefix = "[Перепост]:" if idx == 0 else f"[Перепост #{idx + 1}]:"
+                text = f"{text}\n\n{prefix}\n{src_text}" if text else f"{prefix}\n{src_text}"
+            _parse_attachments(src.get("attachments", []) or [])
 
         if extra_lines:
-            extra_text = "\n".join(extra_lines)
+            # Дедуплицируем повторы ссылок/видео, которые могут приходить одновременно из post и copy_history
+            seen_lines = set()
+            deduped_lines: List[str] = []
+            for line in extra_lines:
+                if line in seen_lines:
+                    continue
+                seen_lines.add(line)
+                deduped_lines.append(line)
+            extra_text = "\n".join(deduped_lines)
             text = f"{text}\n\n{extra_text}" if text else extra_text
 
         text = normalize_vk_markup(text.strip())
@@ -474,6 +689,12 @@ class Pipeline:
             return text[:idx].rstrip()
         return text.strip()
 
+    def _sanitize_news_date(self, date: str) -> str:
+        cleaned = (date or "").replace("\xa0", " ").strip()
+        if re.fullmatch(r"0\s*auto;?", cleaned.lower()):
+            return ""
+        return cleaned
+
     def _news_url_variants(self, url: str) -> List[str]:
         base = (url or "").strip()
         if not base:
@@ -501,16 +722,35 @@ class Pipeline:
         self,
         chunks: Sequence[str],
         caption_limit: int = 1000,
+        body_limit: int = 3500,
+        preserve_more_markers: bool = False,
     ) -> Tuple[Optional[str], List[str]]:
         if not chunks:
             return None, []
         first = chunks[0] or ""
-        first_parts = chunk_text(first, limit=caption_limit) if first else []
-        if not first_parts:
-            first_parts = [""]
-        caption = first_parts[0]
-        extras = [part for part in first_parts[1:] if part]
-        extras.extend([part for part in chunks[1:] if part])
+        if not first:
+            extras = [part for part in chunks[1:] if part]
+            return None, extras
+
+        chunker = chunk_text_preserving_more_markers if preserve_more_markers else chunk_text
+        caption_parts = chunker(first, limit=caption_limit)
+        if not caption_parts:
+            caption_parts = [first[:caption_limit]]
+        caption = caption_parts[0]
+
+        if first.startswith(caption):
+            tail = first[len(caption) :].lstrip()
+        else:
+            tail = ""
+            if len(caption_parts) > 1:
+                tail = "\n\n".join(part for part in caption_parts[1:] if part).strip()
+
+        remainder_blocks: List[str] = []
+        if tail:
+            remainder_blocks.append(tail)
+        remainder_blocks.extend(part for part in chunks[1:] if part)
+        remainder_text = "\n\n".join(block for block in remainder_blocks if block.strip())
+        extras = chunker(remainder_text, limit=body_limit) if remainder_text else []
         return (caption or None), extras
 
     def _render_digest_more_links(self, text: str, html: bool) -> str:
@@ -522,7 +762,7 @@ class Pipeline:
             if not url:
                 return ""
             if html:
-                return f'<a href="{escape_html(url)}">&gt;&gt;</a>'
+                return f'<a href="{url}">&gt;&gt;</a>'
             return f">> {url}"
 
         rendered = re.sub(r"\[\[MORE:([^\]]+)\]\]", repl, text)
@@ -556,11 +796,46 @@ class Pipeline:
             full_text = f"{full_text}\n\n{text_body}" if full_text else text_body
         return full_text.strip()
 
-    async def refresh_recent_posts(self, vk_client: "VKClient", count: int = 10, force: bool = False) -> None:  # type: ignore
+    async def refresh_recent_posts(self, vk_client: "VKClient", count: int = 10, force: bool = False) -> int:  # type: ignore
         log.info("Manual refresh of recent posts (count=%s, force=%s)", count, force)
         items = await vk_client.wall_get_recent(count=count)
+        if not items:
+            log.warning("No VK posts returned for refresh (count=%s, force=%s)", count, force)
+            if force and count == 1:
+                latest_entry = await self.state.get_latest_post_entry()
+                if latest_entry:
+                    post_id, payload, status = latest_entry
+                    existing = await self.state.get_post_record(post_id) or {}
+                    stale_ids = self._normalize_message_ids(existing.get("moderation_message_ids"))
+                    if stale_ids:
+                        deleted = await self.tg.delete_messages(self.config.owner_id, stale_ids)
+                        log.info(
+                            "Deleted stale %s/%s cached post moderation messages before re-send for %s",
+                            deleted,
+                            len(stale_ids),
+                            post_id,
+                        )
+                        await self.state.clear_moderation_message_ids(post_id)
+                    content_hash = self._hash_payload(payload)
+                    token = str(uuid.uuid4()) if self.config.moderation_required else None
+                    await self.state.mark_pending(post_id, content_hash, token, payload=payload)
+                    self.pending_cache[post_id] = payload
+                    if self.config.moderation_required:
+                        await self._send_for_moderation(
+                            post_id,
+                            payload,
+                            token,
+                            use_extended_actions=False,
+                            warn_duplicate=str(status).startswith("published"),
+                        )
+                    else:
+                        await self._publish(post_id, payload)
+                    log.info("Sent latest cached VK post for moderation: %s", post_id)
+                    return 1
+            return 0
         for item in reversed(items):
             await self.handle_post(item, source="manual-refresh", force=force)
+        return len(items)
 
     async def refresh_latest_news(self, force: bool = False) -> None:
         if not self.site:
@@ -659,7 +934,12 @@ class Pipeline:
         if media:
             if len(media) == 1:
                 m = media[0]
-                cap, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
+                cap, extra_chunks = self._split_photo_caption_and_chunks(
+                    chunks,
+                    caption_limit=1000,
+                    body_limit=3500,
+                    preserve_more_markers=False,
+                )
                 msg_id = await self.tg.send_photo(
                     chat_id=self.config.tg_channel_id, photo=m["url"], caption=cap
                 )
@@ -670,7 +950,12 @@ class Pipeline:
                     if mid:
                         message_ids.append(mid)
             else:
-                caption, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
+                caption, extra_chunks = self._split_photo_caption_and_chunks(
+                    chunks,
+                    caption_limit=1000,
+                    body_limit=3500,
+                    preserve_more_markers=False,
+                )
                 group: List[Dict[str, Any]] = []
                 for idx, m in enumerate(media):
                     entry = {"type": m["type"], "media": m["url"]}
@@ -734,10 +1019,11 @@ class Pipeline:
         canonical_url = str(detail.get("canonical_url") or url)
         title = news.get("title") or detail.get("title", "")
         date = news.get("date") or detail.get("date", "")
+        date = self._sanitize_news_date(str(date or ""))
         payload = {
             "url": canonical_url,
             "title": title or "",
-            "date": date or "",
+            "date": date,
             "text": detail.get("text", ""),
             "images": detail.get("images", []),
         }
@@ -777,7 +1063,7 @@ class Pipeline:
         )
         header_prefix = "Новый дайджест на сайте" if is_digest else "Новая новость на сайте"
         header = f"{header_prefix}:\n{self._format_news_text(payload, html=True, include_body=False)}"
-        chunks = chunk_text(f"{header}\n\n{text_body}", limit=1000)
+        chunks = chunk_text_preserving_more_markers(f"{header}\n\n{text_body}", limit=3000)
         keyboard = {
             "inline_keyboard": [
                 [
@@ -852,14 +1138,24 @@ class Pipeline:
     async def _publish_news_tg(self, payload: Dict[str, Any]) -> List[int]:
         full_text = self._format_news_text(payload, html=True)
         message_ids: List[int] = []
-        chunks = chunk_text(full_text, limit=3500)
+        chunks = chunk_text_preserving_more_markers(full_text, limit=3500)
         all_images: List[str] = payload.get("images", []) or []
         images: List[str] = all_images[:1] if self._is_digest_news(payload=payload) else all_images[:10]
 
         if images:
             if len(images) == 1:
-                caption, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
+                caption, extra_chunks = self._split_photo_caption_and_chunks(
+                    chunks,
+                    caption_limit=1000,
+                    body_limit=3500,
+                    preserve_more_markers=True,
+                )
                 rendered_caption = self._render_digest_more_links(caption or "", html=True) or None
+                if rendered_caption and len(rendered_caption) > 1000:
+                    first_parts = chunk_text_preserving_more_markers(caption or "", limit=900)
+                    caption = first_parts[0] if first_parts else ""
+                    rendered_caption = self._render_digest_more_links(caption, html=True) or None
+                    extra_chunks = [part for part in first_parts[1:] if part] + extra_chunks
                 mid = await self.tg.send_photo(
                     chat_id=self.config.tg_channel_id,
                     photo=images[0],
@@ -873,8 +1169,18 @@ class Pipeline:
                     if mid:
                         message_ids.append(mid)
             else:
-                caption, extra_chunks = self._split_photo_caption_and_chunks(chunks, caption_limit=1000)
+                caption, extra_chunks = self._split_photo_caption_and_chunks(
+                    chunks,
+                    caption_limit=1000,
+                    body_limit=3500,
+                    preserve_more_markers=True,
+                )
                 rendered_caption = self._render_digest_more_links(caption or "", html=True) or None
+                if rendered_caption and len(rendered_caption) > 1000:
+                    first_parts = chunk_text_preserving_more_markers(caption or "", limit=900)
+                    caption = first_parts[0] if first_parts else ""
+                    rendered_caption = self._render_digest_more_links(caption, html=True) or None
+                    extra_chunks = [part for part in first_parts[1:] if part] + extra_chunks
                 group = []
                 for idx, img in enumerate(images):
                     entry = {"type": "photo", "media": img}
@@ -901,6 +1207,9 @@ class Pipeline:
         if not self.vk:
             raise RuntimeError("VK client is not configured")
         text = self._format_news_text(payload, html=False)
+        source_link = str(payload.get("url") or "").strip()
+        if source_link and source_link not in text:
+            text = f"{source_link}\n\n{text}" if text else source_link
         if len(text) > 6000:
             text = text[:6000] + "…"
         attachments: List[str] = []
@@ -910,6 +1219,16 @@ class Pipeline:
         if images and not self.config.dry_run:
             max_images = 1 if is_digest else 10
             attachments = await self.vk.upload_wall_photos(images, max_images=max_images)
+            if not attachments:
+                # Для group-token upload API недоступен; публикуем без attachments.
+                # Превью строится по ссылке на новость внутри текста поста.
+                attachments = []
+                if source_link:
+                    log.warning(
+                        "VK photo upload returned no attachments; "
+                        "posting without attachments and relying on link preview: %s",
+                        source_link,
+                    )
         if self.config.dry_run:
             log.info("[dry-run] VK wall.post: %s", text[:200])
             return None

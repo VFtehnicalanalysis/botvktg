@@ -424,17 +424,31 @@ class SiteClient:
         for source in (content_html, html):
             m = re.search(r'<p class="title_text"[^>]*>(.*?)</p>', source, re.S | re.I)
             if m:
-                return self._strip_tags(m.group(1))
+                candidate = self._normalize_extracted_date(self._strip_tags(m.group(1)))
+                if candidate:
+                    return candidate
             m = re.search(r'<span class="news_date"[^>]*>(.*?)</span>', source, re.S | re.I)
             if m:
-                return self._strip_tags(m.group(1))
+                candidate = self._normalize_extracted_date(self._strip_tags(m.group(1)))
+                if candidate:
+                    return candidate
         m = DATE_RE.search(content_html)
         if m:
-            return m.group(0).strip()
+            candidate = self._normalize_extracted_date(m.group(0).strip())
+            if candidate:
+                return candidate
         m = DATE_RE.search(html)
         if m:
-            return m.group(0).strip()
+            candidate = self._normalize_extracted_date(m.group(0).strip())
+            if candidate:
+                return candidate
         return ""
+
+    def _normalize_extracted_date(self, date: str) -> str:
+        cleaned = (date or "").replace("\xa0", " ").strip()
+        if re.fullmatch(r"0\s*auto;?", cleaned.lower()):
+            return ""
+        return cleaned
 
     def _strip_tags(self, html: str) -> str:
         text = re.sub(r"<[^>]+>", " ", html)
@@ -497,6 +511,8 @@ class SiteClient:
             if not ln:
                 continue
             ln_norm = ln.replace("\xa0", " ").strip().lower()
+            if re.fullmatch(r"0\s*auto;?", ln_norm):
+                continue
             if ln_norm in {"ресурсы", "ресурсы:"}:
                 break
             if any(marker in ln_norm for marker in footer_markers):

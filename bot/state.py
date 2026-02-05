@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 class StateStore:
@@ -137,6 +137,30 @@ class StateStore:
 
     async def get_post_record(self, post_id: int) -> Optional[Dict[str, object]]:
         return self._data.get("posts", {}).get(str(post_id))  # type: ignore
+
+    async def get_latest_post_entry(self) -> Optional[Tuple[int, Dict[str, object], str]]:
+        posts = self._data.get("posts", {})  # type: ignore
+        if not isinstance(posts, dict) or not posts:
+            return None
+        latest_post_id: Optional[int] = None
+        latest_record: Optional[Dict[str, object]] = None
+        for key, value in posts.items():
+            try:
+                post_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            if latest_post_id is None or post_id > latest_post_id:
+                latest_post_id = post_id
+                latest_record = value
+        if latest_post_id is None or latest_record is None:
+            return None
+        payload = latest_record.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        status = str(latest_record.get("status") or "")
+        return latest_post_id, payload, status
 
     async def get_payload(self, post_id: int) -> Optional[Dict[str, object]]:
         post = self._data.get("posts", {}).get(str(post_id))  # type: ignore
