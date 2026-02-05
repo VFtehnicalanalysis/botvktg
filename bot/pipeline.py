@@ -415,11 +415,17 @@ class Pipeline:
             if status in {"approved", "pending", "rejected"} or str(status).startswith("published"):
                 log.info("Skip news (status=%s): %s", status, url)
                 return
-        detail = await self.site.fetch_news_detail(url, title=news.get("title")) if self.site else {"text": "", "images": []}
+        detail = (
+            await self.site.fetch_news_detail(url, title=news.get("title"))
+            if self.site
+            else {"text": "", "images": []}
+        )
+        title = news.get("title") or detail.get("title", "")
+        date = news.get("date") or detail.get("date", "")
         payload = {
             "url": url,
-            "title": news.get("title", ""),
-            "date": news.get("date", ""),
+            "title": title or "",
+            "date": date or "",
             "text": detail.get("text", ""),
             "images": detail.get("images", []),
         }

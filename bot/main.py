@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from .config import load_config
@@ -99,12 +100,19 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                     msg = upd["message"]
                     text = msg.get("text") or ""
                     from_id = msg.get("from", {}).get("id")
-                    if from_id == tg.config.owner_id and text.strip().lower() in {"/refresh", "обновить посты"}:
-                        if tg.config.source_mode in ("vk", "vk+site"):
-                            await pipeline.refresh_recent_posts(vk)
-                        if tg.config.source_mode in ("site", "vk+site"):
-                            await pipeline.refresh_latest_news()
-                        await tg.notify_owner("Ручное обновление завершено (без дублей).")
+                    if from_id == tg.config.owner_id:
+                        lowered = text.strip().lower()
+                        if lowered in {"/refresh", "обновить посты"}:
+                            if tg.config.source_mode in ("vk", "vk+site"):
+                                await pipeline.refresh_recent_posts(vk)
+                            if tg.config.source_mode in ("site", "vk+site"):
+                                await pipeline.refresh_latest_news()
+                            await tg.notify_owner("Ручное обновление завершено (без дублей).")
+                            continue
+                        url = _extract_first_url(text)
+                        if url and pipeline.site and pipeline.site.is_supported_news_url(url):
+                            await pipeline.handle_news({"url": url, "title": "", "date": ""}, force=True)
+                            await tg.notify_owner(f"Новость поставлена на модерацию: {url}")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -198,6 +206,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="VK to Telegram bot")
     parser.add_argument("--dry-run", action="store_true", help="Log actions without sending to Telegram")
     return parser.parse_args()
+
+
+def _extract_first_url(text: str) -> Optional[str]:
+    match = re.search(r"(https?://\S+|www\.\S+)", text)
+    if not match:
+        return None
+    url = match.group(0).strip()
+    while url and url[-1] in ").,;:!?]>\"'":
+        url = url[:-1]
+    if url.startswith("www."):
+        url = f"https://{url}"
+    return url
 
 
 def main() -> None:

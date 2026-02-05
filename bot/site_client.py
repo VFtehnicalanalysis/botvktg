@@ -60,7 +60,7 @@ DATE_RE = re.compile(r"\b\d{1,2}\s+[A-Za-zА-Яа-яЁё]+\b(?:\s+\d{4})?", re.I
 
 def _is_news_link(href: str) -> bool:
     href_l = href.lower()
-    return any(token in href_l for token in ("news.", "article.", "/news/", "/article/"))
+    return any(token in href_l for token in ("news.", "article.", "/news/", "/article/", "/digest/", "digest."))
 
 
 class FeedParser(HTMLParser):
@@ -121,6 +121,13 @@ class SiteClient:
     async def close(self) -> None:
         await self.client.aclose()
 
+    def is_supported_news_url(self, url: str) -> bool:
+        url_l = url.lower()
+        base = self.config.site_base_url.lower()
+        if url_l.startswith(base):
+            url_l = url_l[len(base) :]
+        return _is_news_link(url_l)
+
     async def fetch_latest_news(self) -> Optional[Dict[str, str]]:
         url = f"{self.config.site_base_url}{self.config.site_news_path}"
         resp = await self.client.get(url)
@@ -171,11 +178,13 @@ class SiteClient:
         resp.raise_for_status()
         html = unescape(resp.text)
         content_html = self._extract_main_block(html)
+        extracted_title = title or self._extract_title(content_html, html)
+        extracted_date = self._extract_date(content_html, html)
         # текст
-        is_digest = self._is_digest(title)
+        is_digest = self._is_digest(extracted_title, url=url)
         parser = TextExtractor()
         parser.feed(content_html)
-        text = self._clean_text(parser.text(), title, is_digest=is_digest)
+        text = self._clean_text(parser.text(), extracted_title, is_digest=is_digest)
         # изображения: только с нашего домена, допустимые расширения или raw.php
         images: List[str] = []
         icon_images: List[str] = []
@@ -205,7 +214,13 @@ class SiteClient:
         filtered = await self._filter_images(uniq_images, max_results=10)
         if is_digest and filtered:
             filtered = filtered[:1]
-        return {"text": text, "images": filtered, "is_digest": is_digest}
+        return {
+            "text": text,
+            "images": filtered,
+            "is_digest": is_digest,
+            "title": extracted_title or "",
+            "date": extracted_date or "",
+        }
 
     def _is_candidate_image(self, src: str) -> bool:
         allowed_ext = (".jpg", ".jpeg", ".png", ".webp", ".gif")
@@ -258,13 +273,12 @@ class SiteClient:
 
     def _extract_aef_news_icon_images(self, html: str) -> List[str]:
         urls: List[str] = []
-        matches = re.findall(
-            r'class="aef_news_icon"[^>]*style="[^"]*background-image:\s*url\(([^)]+)\)',
-            html,
-            re.I,
-        )
-        for raw_url in matches:
-            cleaned = raw_url.strip().strip("'\"")
+        for match in re.finditer(r'<div[^>]*class="[^"]*aef_news_icon[^"]*"[^>]*>', html, re.I):
+            tag = match.group(0)
+            style_match = re.search(r'background-image:\s*url\(([^)]+)\)', tag, re.I)
+            if not style_match:
+                continue
+            cleaned = style_match.group(1).strip().strip("'\"")
             if not cleaned:
                 continue
             if not self._is_candidate_image(cleaned):
@@ -272,10 +286,40 @@ class SiteClient:
             urls.append(_abs_url(self.config.site_base_url, cleaned))
         return urls
 
-    def _is_digest(self, title: Optional[str]) -> bool:
-        if not title:
-            return False
-        return "дайджест" in title.lower()
+    def _is_digest(self, title: Optional[str], url: Optional[str] = None) -> bool:
+        title_l = (title or "").lower()
+        url_l = (url or "").lower()
+        return ("дайджест" in title_l) or ("digest" in title_l) or ("/digest/" in url_l)
+
+    def _extract_title(self, content_html: str, html: str) -> str:
+        for source in (content_html, html):
+            m = re.search(r"<h1[^>]*>(.*?)</h1>", source, re.S | re.I)
+            if m:
+                return self._strip_tags(m.group(1))
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+        if m:
+            return self._strip_tags(m.group(1))
+        return ""
+
+    def _extract_date(self, content_html: str, html: str) -> str:
+        for source in (content_html, html):
+            m = re.search(r'<p class="title_text"[^>]*>(.*?)</p>', source, re.S | re.I)
+            if m:
+                return self._strip_tags(m.group(1))
+            m = re.search(r'<span class="news_date"[^>]*>(.*?)</span>', source, re.S | re.I)
+            if m:
+                return self._strip_tags(m.group(1))
+        m = DATE_RE.search(content_html)
+        if m:
+            return m.group(0).strip()
+        m = DATE_RE.search(html)
+        if m:
+            return m.group(0).strip()
+        return ""
+
+    def _strip_tags(self, html: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", html)
+        return re.sub(r"\s+", " ", text).strip()
 
     def _clean_text(self, text: str, title: Optional[str], is_digest: bool = False) -> str:
         if is_digest:
