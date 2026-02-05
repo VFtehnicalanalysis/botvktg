@@ -11,6 +11,7 @@ from .pipeline import Pipeline
 from .state import StateStore
 from .tg_client import TelegramClient
 from .vk_client import VKClient
+from .site_client import SiteClient
 
 log = logging.getLogger(__name__)
 
@@ -77,8 +78,21 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                     if data == "refresh_posts" and user_id == tg.config.owner_id:
                         if cb.get("id"):
                             await tg.answer_callback_query(cb["id"], text="Обновление запущено")
-                        await pipeline.refresh_recent_posts(vk)
+                        if tg.config.source_mode in ("vk", "vk+site"):
+                            await pipeline.refresh_recent_posts(vk)
+                        if tg.config.source_mode in ("site", "vk+site"):
+                            await pipeline.refresh_latest_news()
                         await tg.notify_owner("Ручное обновление завершено (без дублей).")
+                    elif data == "latest_vk" and user_id == tg.config.owner_id:
+                        if cb.get("id"):
+                            await tg.answer_callback_query(cb["id"], text="Берем крайний пост VK")
+                        if tg.config.source_mode in ("vk", "vk+site"):
+                            await pipeline.refresh_recent_posts(vk, count=1, force=True)
+                    elif data == "latest_site" and user_id == tg.config.owner_id:
+                        if cb.get("id"):
+                            await tg.answer_callback_query(cb["id"], text="Берем крайнюю новость сайта")
+                        if tg.config.source_mode in ("site", "vk+site"):
+                            await pipeline.refresh_latest_news(force=True)
                     else:
                         await pipeline.handle_callback(upd)
                 elif "message" in upd:
@@ -86,7 +100,10 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                     text = msg.get("text") or ""
                     from_id = msg.get("from", {}).get("id")
                     if from_id == tg.config.owner_id and text.strip().lower() in {"/refresh", "обновить посты"}:
-                        await pipeline.refresh_recent_posts(vk)
+                        if tg.config.source_mode in ("vk", "vk+site"):
+                            await pipeline.refresh_recent_posts(vk)
+                        if tg.config.source_mode in ("site", "vk+site"):
+                            await pipeline.refresh_latest_news()
                         await tg.notify_owner("Ручное обновление завершено (без дублей).")
         except asyncio.CancelledError:
             raise
@@ -105,26 +122,58 @@ async def run(dry_run: bool = False) -> None:
 
     tg = TelegramClient(config)
     vk = VKClient(config)
-    pipeline = Pipeline(config, state, tg)
+    site = SiteClient(config)
+    pipeline = Pipeline(config, state, tg, site=site, vk=vk)
 
     try:
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "🔄 Обновить посты", "callback_data": "refresh_posts"}],
+                [{"text": "📌 Крайний пост VK", "callback_data": "latest_vk"}],
+                [{"text": "📰 Крайняя новость сайта", "callback_data": "latest_site"}],
+            ]
+        }
         await tg.send_message(
             chat_id=config.owner_id,
             text=f"Бот запущен. moderation={config.moderation_mode}, dry_run={dry_run}.",
-            reply_markup={
-                "inline_keyboard": [
-                    [{"text": "🔄 Обновить посты", "callback_data": "refresh_posts"}],
-                ]
-            },
+            reply_markup=keyboard,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("Failed to notify owner on startup: %s", exc)
 
-    tasks = [
-        asyncio.create_task(vk_loop(vk, pipeline, state, tg), name="vk_loop"),
-        asyncio.create_task(vk_fallback_loop(vk, pipeline), name="vk_fallback"),
-        asyncio.create_task(tg_callback_loop(tg, pipeline, vk), name="tg_callback"),
-    ]
+    tasks = []
+    if config.source_mode in ("vk", "vk+site"):
+        tasks.append(asyncio.create_task(vk_loop(vk, pipeline, state, tg), name="vk_loop"))
+        tasks.append(asyncio.create_task(vk_fallback_loop(vk, pipeline), name="vk_fallback"))
+    tasks.append(asyncio.create_task(tg_callback_loop(tg, pipeline, vk), name="tg_callback"))
+    if config.source_mode in ("site", "vk+site"):
+        async def site_worker():
+            same_error: Optional[str] = None
+            err_count = 0
+            while True:
+                try:
+                    await pipeline.refresh_latest_news()
+                    same_error = None
+                    err_count = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("Site worker error: %s", exc)
+                    msg = str(exc)
+                    if same_error == msg:
+                        err_count += 1
+                    else:
+                        same_error = msg
+                        err_count = 1
+                    if err_count >= 5:
+                        warn = f"Site worker stopped after 5 identical errors: {msg}"
+                        log.error(warn)
+                        try:
+                            await tg.notify_owner(warn)
+                        finally:
+                            raise SystemExit(warn) from exc
+                await asyncio.sleep(config.site_poll_interval)
+        tasks.append(asyncio.create_task(site_worker(), name="site_worker"))
     try:
         await asyncio.gather(*tasks)
     except SystemExit as exc:
@@ -142,6 +191,7 @@ async def run(dry_run: bool = False) -> None:
     finally:
         await tg.close()
         await vk.close()
+        await site.close()
 
 
 def parse_args() -> argparse.Namespace:

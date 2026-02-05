@@ -22,18 +22,22 @@ class VKClient:
     async def close(self) -> None:
         await self.client.aclose()
 
-    async def get_longpoll_server(self) -> None:
+    async def _api_call(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         params = {
-            "group_id": self.config.vk_group_id,
+            **params,
             "access_token": self.config.vk_token,
             "v": self.config.vk_api_version,
         }
-        resp = await self.client.get(f"{self.api_url}/groups.getLongPollServer", params=params)
+        resp = await self.client.post(f"{self.api_url}/{method}", data=params)
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
-            raise RuntimeError(f"VK error: {data['error']}")
-        server_info = data["response"]
+            raise RuntimeError(f"VK {method} error: {data['error']}")
+        return data.get("response", data)
+
+    async def get_longpoll_server(self) -> None:
+        params = {"group_id": self.config.vk_group_id}
+        server_info = await self._api_call("groups.getLongPollServer", params)
         self.longpoll_server = server_info["server"]
         self.longpoll_key = server_info["key"]
         self.ts = server_info["ts"]
@@ -77,16 +81,70 @@ class VKClient:
         return self.ts, updates
 
     async def wall_get_recent(self, count: int = 5) -> List[Dict[str, Any]]:
-        params = {
-            "owner_id": -abs(self.config.vk_group_id),
-            "count": count,
-            "access_token": self.config.vk_token,
-            "v": self.config.vk_api_version,
-        }
-        resp = await self.client.get(f"{self.api_url}/wall.get", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            log.error("VK wall.get error: %s", data["error"])
+        params = {"owner_id": -abs(self.config.vk_group_id), "count": count}
+        try:
+            data = await self._api_call("wall.get", params)
+        except Exception as exc:  # noqa: BLE001
+            log.error("VK wall.get error: %s", exc)
             return []
-        return data.get("response", {}).get("items", [])
+        return data.get("items", [])
+
+    async def wall_post(self, message: str, attachments: Optional[List[str]] = None) -> Optional[int]:
+        if not self.config.vk_group_id or not self.config.vk_token:
+            raise RuntimeError("VK credentials are not configured")
+        params: Dict[str, Any] = {
+            "owner_id": -abs(self.config.vk_group_id),
+            "from_group": 1,
+            "message": message,
+        }
+        if attachments:
+            params["attachments"] = ",".join(attachments)
+        data = await self._api_call("wall.post", params)
+        return data.get("post_id")
+
+    async def upload_wall_photos(self, urls: List[str], max_images: int = 10) -> List[str]:
+        if not self.config.vk_group_id or not self.config.vk_token:
+            raise RuntimeError("VK credentials are not configured")
+        attachments: List[str] = []
+        for url in urls[:max_images]:
+            try:
+                upload_url = await self._get_wall_upload_server()
+                img_resp = await self.client.get(url, follow_redirects=True, timeout=20.0)
+                img_resp.raise_for_status()
+                filename = url.split("/")[-1] or "image.jpg"
+                upload_resp = await self.client.post(upload_url, files={"photo": (filename, img_resp.content)})
+                upload_resp.raise_for_status()
+                upload_data = upload_resp.json()
+                save_params = {
+                    "group_id": self.config.vk_group_id,
+                    "photo": upload_data.get("photo"),
+                    "server": upload_data.get("server"),
+                    "hash": upload_data.get("hash"),
+                }
+                saved = await self._api_call("photos.saveWallPhoto", save_params)
+                if isinstance(saved, list) and saved:
+                    photo = saved[0]
+                elif isinstance(saved, dict) and saved.get("response"):
+                    photo = saved["response"][0]
+                else:
+                    continue
+                owner_id = photo.get("owner_id")
+                photo_id = photo.get("id")
+                if not owner_id or not photo_id:
+                    continue
+                access_key = photo.get("access_key")
+                if access_key:
+                    attachments.append(f"photo{owner_id}_{photo_id}_{access_key}")
+                else:
+                    attachments.append(f"photo{owner_id}_{photo_id}")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Skip image upload to VK: %s -> %s", url, exc)
+        return attachments
+
+    async def _get_wall_upload_server(self) -> str:
+        params = {"group_id": self.config.vk_group_id}
+        data = await self._api_call("photos.getWallUploadServer", params)
+        upload_url = data.get("upload_url")
+        if not upload_url:
+            raise RuntimeError("VK upload_url not found")
+        return upload_url

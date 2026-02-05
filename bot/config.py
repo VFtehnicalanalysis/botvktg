@@ -14,11 +14,15 @@ class Config:
     tg_channel_id: str
     owner_id: int
     moderation_mode: str  # "required" or "off"
+    source_mode: str  # "vk", "site", "vk+site"
     vk_api_version: str = "5.199"
     longpoll_wait: int = 25
     log_dir: Path = Path("logs")
     state_path: Path = Path("state.json")
     dry_run: bool = False
+    site_base_url: str = "https://www.econ.msu.ru"
+    site_news_path: str = "/alumni/"
+    site_poll_interval: int = 900  # seconds
 
     @property
     def moderation_required(self) -> bool:
@@ -57,6 +61,7 @@ def load_config(password_file: Path = Path("password"), dry_run: bool = False) -
     tg_channel_id = get("TG_CHANNEL_ID", "")
     owner_id = int(get("OWNER_ID", "0"))
     moderation_mode = get("MODERATION_MODE", "required").lower()
+    source_mode = get("SOURCE_MODE", "vk+site").lower()
 
     return Config(
         vk_group_id=vk_group_id,
@@ -65,6 +70,7 @@ def load_config(password_file: Path = Path("password"), dry_run: bool = False) -
         tg_channel_id=tg_channel_id,
         owner_id=owner_id,
         moderation_mode=moderation_mode,
+        source_mode=source_mode,
         dry_run=dry_run,
         log_dir=Path("logs"),
         state_path=Path("state.json"),
