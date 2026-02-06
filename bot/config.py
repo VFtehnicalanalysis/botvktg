@@ -56,12 +56,21 @@ def load_config(password_file: Path = Path("password"), dry_run: bool = False) -
     def get(name: str, default: Optional[str] = None) -> str:
         return env.get(name, file_vars.get(name, default))
 
-    vk_group_id = int(get("VK_GROUP_ID", "0"))
+    def get_int(name: str, default: int = 0) -> int:
+        raw = str(get(name, str(default)) or "").strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    vk_group_id = get_int("VK_GROUP_ID", 0)
     vk_token = get("VK_GROUP_TOKEN", "")
     vk_user_token = get("VK_USER_TOKEN", "")
     tg_bot_token = get("TG_BOT_TOKEN", "")
     tg_channel_id = get("TG_CHANNEL_ID", "")
-    owner_id = int(get("OWNER_ID", "0"))
+    owner_id = get_int("OWNER_ID", 0)
     moderation_mode = get("MODERATION_MODE", "required").lower()
     source_mode = get("SOURCE_MODE", "vk+site").lower()
 
