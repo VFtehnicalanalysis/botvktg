@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class StateStore:
@@ -86,7 +86,7 @@ class StateStore:
                 "status": "pending" if token else "auto",
                 "token": token,
                 "tg_message_ids": [],
-                "moderation_message_ids": [],
+                "moderation_message_ids": {},
                 "updated_at": now,
                 "payload": payload or {},
             }
@@ -168,25 +168,65 @@ class StateStore:
             return None
         return post.get("payload")  # type: ignore
 
-    async def set_moderation_message_ids(self, post_id: int, message_ids: List[int]) -> None:
+    def _normalize_message_ids(self, raw_value: Any) -> List[int]:
+        if not isinstance(raw_value, list):
+            return []
+        normalized: List[int] = []
+        for item in raw_value:
+            try:
+                message_id = int(item)
+            except (TypeError, ValueError):
+                continue
+            normalized.append(message_id)
+        return normalized
+
+    def _normalize_message_id_map(self, raw_value: Any) -> Dict[str, List[int]]:
+        if isinstance(raw_value, dict):
+            normalized_map: Dict[str, List[int]] = {}
+            for chat_id, message_ids in raw_value.items():
+                normalized_ids = self._normalize_message_ids(message_ids)
+                if normalized_ids:
+                    normalized_map[str(chat_id)] = normalized_ids
+            return normalized_map
+        legacy_ids = self._normalize_message_ids(raw_value)
+        if not legacy_ids:
+            return {}
+        # Backward compatibility with old state format (plain list for OWNER_ID).
+        return {"legacy": legacy_ids}
+
+    async def set_moderation_message_ids(
+        self, post_id: int, message_ids_by_chat: Dict[int, List[int]]
+    ) -> None:
         async with self._lock:
             post = self._data.get("posts", {}).get(str(post_id))
             if post is not None:
-                post["moderation_message_ids"] = message_ids
+                normalized_map: Dict[str, List[int]] = {}
+                for chat_id, message_ids in message_ids_by_chat.items():
+                    normalized_ids = self._normalize_message_ids(message_ids)
+                    if normalized_ids:
+                        normalized_map[str(chat_id)] = normalized_ids
+                post["moderation_message_ids"] = normalized_map
                 post["updated_at"] = int(time.time())
             await self.save()
 
-    async def get_moderation_message_ids(self, post_id: int) -> List[int]:
+    async def get_moderation_message_id_map(self, post_id: int) -> Dict[str, List[int]]:
         post = self._data.get("posts", {}).get(str(post_id))  # type: ignore
         if not post:
-            return []
-        return post.get("moderation_message_ids", [])  # type: ignore
+            return {}
+        return self._normalize_message_id_map(post.get("moderation_message_ids"))
+
+    async def get_moderation_message_ids(self, post_id: int) -> List[int]:
+        message_id_map = await self.get_moderation_message_id_map(post_id)
+        flattened: List[int] = []
+        for message_ids in message_id_map.values():
+            flattened.extend(message_ids)
+        return flattened
 
     async def clear_moderation_message_ids(self, post_id: int) -> None:
         async with self._lock:
             post = self._data.get("posts", {}).get(str(post_id))
             if post is not None:
-                post["moderation_message_ids"] = []
+                post["moderation_message_ids"] = {}
                 post["updated_at"] = int(time.time())
             await self.save()
 
@@ -221,7 +261,7 @@ class StateStore:
                 "status": "pending" if token else "auto",
                 "token": token,
                 "tg_message_ids": [],
-                "moderation_message_ids": [],
+                "moderation_message_ids": {},
                 "updated_at": now,
                 "payload": payload or {},
             }
@@ -299,25 +339,39 @@ class StateStore:
     async def get_news_record(self, url: str) -> Optional[Dict[str, object]]:
         return self._data.get("news", {}).get(url)  # type: ignore
 
-    async def set_news_moderation_message_ids(self, url: str, message_ids: List[int]) -> None:
+    async def set_news_moderation_message_ids(
+        self, url: str, message_ids_by_chat: Dict[int, List[int]]
+    ) -> None:
         async with self._lock:
             news = self._data.get("news", {}).get(url)
             if news is not None:
-                news["moderation_message_ids"] = message_ids
+                normalized_map: Dict[str, List[int]] = {}
+                for chat_id, message_ids in message_ids_by_chat.items():
+                    normalized_ids = self._normalize_message_ids(message_ids)
+                    if normalized_ids:
+                        normalized_map[str(chat_id)] = normalized_ids
+                news["moderation_message_ids"] = normalized_map
                 news["updated_at"] = int(time.time())
             await self.save()
 
-    async def get_news_moderation_message_ids(self, url: str) -> List[int]:
+    async def get_news_moderation_message_id_map(self, url: str) -> Dict[str, List[int]]:
         news = self._data.get("news", {}).get(url)  # type: ignore
         if not news:
-            return []
-        return news.get("moderation_message_ids", [])  # type: ignore
+            return {}
+        return self._normalize_message_id_map(news.get("moderation_message_ids"))
+
+    async def get_news_moderation_message_ids(self, url: str) -> List[int]:
+        message_id_map = await self.get_news_moderation_message_id_map(url)
+        flattened: List[int] = []
+        for message_ids in message_id_map.values():
+            flattened.extend(message_ids)
+        return flattened
 
     async def clear_news_moderation_message_ids(self, url: str) -> None:
         async with self._lock:
             news = self._data.get("news", {}).get(url)
             if news is not None:
-                news["moderation_message_ids"] = []
+                news["moderation_message_ids"] = {}
                 news["updated_at"] = int(time.time())
             await self.save()
 

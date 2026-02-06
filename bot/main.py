@@ -17,6 +17,36 @@ from .site_client import SiteClient
 log = logging.getLogger(__name__)
 
 
+def _format_telegram_actor(user: Dict[str, Any]) -> str:
+    user_id = user.get("id")
+    username = str(user.get("username") or "").strip()
+    first_name = str(user.get("first_name") or "").strip()
+    last_name = str(user.get("last_name") or "").strip()
+    if username:
+        label = f"@{username}"
+    else:
+        full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+        label = full_name or "неизвестный пользователь"
+    if user_id:
+        return f"{label} (id={user_id})"
+    return label
+
+
+async def _notify_owner_about_moderator_action(
+    tg: TelegramClient,
+    user_id: Optional[int],
+    user: Dict[str, Any],
+    action: str,
+) -> None:
+    if tg.config.is_owner(user_id):
+        return
+    actor = _format_telegram_actor(user)
+    try:
+        await tg.notify_owner(f"Модератор {actor}: {action}")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to notify owner about moderator action: %s", exc)
+
+
 async def vk_loop(vk: VKClient, pipeline: Pipeline, state: StateStore, tg: TelegramClient) -> None:
     same_error: Optional[str] = None
     error_count = 0
@@ -75,10 +105,19 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                 if "callback_query" in upd:
                     cb = upd["callback_query"]
                     data = cb.get("data") or ""
-                    user_id = cb.get("from", {}).get("id")
-                    if data == "refresh_posts" and user_id == tg.config.owner_id:
+                    from_user = cb.get("from", {}) or {}
+                    user_id = from_user.get("id")
+                    is_moderator = tg.config.is_moderator(user_id)
+                    if data in {"refresh_posts", "latest_vk", "latest_site", "news_by_link"} and not is_moderator:
+                        if cb.get("id"):
+                            await tg.answer_callback_query(cb["id"], text="Нет доступа")
+                        continue
+                    if data == "refresh_posts" and is_moderator:
                         if cb.get("id"):
                             await tg.answer_callback_query(cb["id"], text="Обновление запущено")
+                        await _notify_owner_about_moderator_action(
+                            tg, user_id, from_user, "запустил ручное обновление постов."
+                        )
                         if tg.config.source_mode in ("vk", "vk+site"):
                             vk_count = await pipeline.refresh_recent_posts(vk)
                             if vk_count == 0:
@@ -89,23 +128,32 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                         if tg.config.source_mode in ("site", "vk+site"):
                             await pipeline.refresh_latest_news()
                         await tg.notify_owner("Ручное обновление завершено (без дублей).")
-                    elif data == "latest_vk" and user_id == tg.config.owner_id:
+                    elif data == "latest_vk" and is_moderator:
                         if cb.get("id"):
                             await tg.answer_callback_query(cb["id"], text="Берем крайний пост VK")
+                        await _notify_owner_about_moderator_action(
+                            tg, user_id, from_user, "запросил крайний пост VK."
+                        )
                         if tg.config.source_mode in ("vk", "vk+site"):
                             vk_count = await pipeline.refresh_recent_posts(vk, count=1, force=True)
                             if vk_count == 0:
                                 await tg.notify_owner(
                                     "Не удалось получить крайний пост VK из кеша авто-потока."
                                 )
-                    elif data == "latest_site" and user_id == tg.config.owner_id:
+                    elif data == "latest_site" and is_moderator:
                         if cb.get("id"):
                             await tg.answer_callback_query(cb["id"], text="Берем крайнюю новость сайта")
+                        await _notify_owner_about_moderator_action(
+                            tg, user_id, from_user, "запросил крайнюю новость сайта."
+                        )
                         if tg.config.source_mode in ("site", "vk+site"):
                             await pipeline.refresh_latest_news(force=True)
-                    elif data == "news_by_link" and user_id == tg.config.owner_id:
+                    elif data == "news_by_link" and is_moderator:
                         if cb.get("id"):
                             await tg.answer_callback_query(cb["id"], text="Пришлите ссылку в чат")
+                        await _notify_owner_about_moderator_action(
+                            tg, user_id, from_user, "открыл режим публикации новости по ссылке."
+                        )
                         await tg.notify_owner(
                             "Пришлите ссылку на новость/дайджест с сайта одним сообщением."
                         )
@@ -114,10 +162,14 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                 elif "message" in upd:
                     msg = upd["message"]
                     text = msg.get("text") or ""
-                    from_id = msg.get("from", {}).get("id")
-                    if from_id == tg.config.owner_id:
+                    from_user = msg.get("from", {}) or {}
+                    from_id = from_user.get("id")
+                    if tg.config.is_moderator(from_id):
                         lowered = text.strip().lower()
                         if lowered in {"/refresh", "обновить посты"}:
+                            await _notify_owner_about_moderator_action(
+                                tg, from_id, from_user, "запустил ручное обновление постов через команду."
+                            )
                             if tg.config.source_mode in ("vk", "vk+site"):
                                 vk_count = await pipeline.refresh_recent_posts(vk)
                                 if vk_count == 0:
@@ -131,7 +183,16 @@ async def tg_callback_loop(tg: TelegramClient, pipeline: Pipeline, vk: "VKClient
                             continue
                         url = _extract_first_url(text)
                         if url and pipeline.site and pipeline.site.is_supported_news_url(url):
+                            await _notify_owner_about_moderator_action(
+                                tg, from_id, from_user, f"передал ссылку для публикации: {url}"
+                            )
                             await pipeline.handle_news({"url": url, "title": "", "date": ""}, force=True)
+                    elif from_id:
+                        chat_id = (msg.get("chat") or {}).get("id") or from_id
+                        await tg.send_message(
+                            chat_id=chat_id,
+                            text="Это приватный бот, он недоступен всем пользователям",
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -152,22 +213,24 @@ async def run(dry_run: bool = False) -> None:
     site = SiteClient(config)
     pipeline = Pipeline(config, state, tg, site=site, vk=vk)
 
-    try:
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "🔄 Обновить посты", "callback_data": "refresh_posts"}],
-                [{"text": "📌 Крайний пост VK", "callback_data": "latest_vk"}],
-                [{"text": "📰 Крайняя новость сайта", "callback_data": "latest_site"}],
-                [{"text": "🔗 Новость по ссылке", "callback_data": "news_by_link"}],
-            ]
-        }
-        await tg.send_message(
-            chat_id=config.owner_id,
-            text=f"Бот запущен. moderation={config.moderation_mode}, dry_run={dry_run}.",
-            reply_markup=keyboard,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Failed to notify owner on startup: %s", exc)
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "🔄 Обновить посты", "callback_data": "refresh_posts"}],
+            [{"text": "📌 Крайний пост VK", "callback_data": "latest_vk"}],
+            [{"text": "📰 Крайняя новость сайта", "callback_data": "latest_site"}],
+            [{"text": "🔗 Новость по ссылке", "callback_data": "news_by_link"}],
+        ]
+    }
+    targets = config.all_moderator_ids
+    for chat_id in targets:
+        try:
+            await tg.send_message(
+                chat_id=chat_id,
+                text=f"Бот запущен. moderation={config.moderation_mode}, dry_run={dry_run}.",
+                reply_markup=keyboard,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to notify moderator %s on startup: %s", chat_id, exc)
 
     tasks = []
     if config.source_mode in ("vk", "vk+site"):

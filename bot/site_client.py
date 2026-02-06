@@ -60,7 +60,19 @@ DATE_RE = re.compile(r"\b\d{1,2}\s+[A-Za-zА-Яа-яЁё]+\b(?:\s+\d{4})?", re.I
 
 def _is_news_link(href: str) -> bool:
     href_l = href.lower()
-    return any(token in href_l for token in ("news.", "article.", "/news/", "/article/", "/digest/", "digest."))
+    return any(
+        token in href_l
+        for token in (
+            "news.",
+            "article.",
+            "events.",
+            "/news/",
+            "/article/",
+            "/events/",
+            "/digest/",
+            "digest.",
+        )
+    )
 
 
 class FeedParser(HTMLParser):
@@ -219,7 +231,7 @@ class SiteClient:
         raw_text = parser.text()
         if not is_digest and self._looks_like_digest_text(raw_text, html):
             is_digest = True
-        text = self._clean_text(raw_text, extracted_title, is_digest=is_digest)
+        text = self._clean_text(raw_text, extracted_title, is_digest=is_digest, source_url=final_url or url)
         # изображения: только с нашего домена, допустимые расширения или raw.php
         images: List[str] = []
         if is_digest:
@@ -254,16 +266,30 @@ class SiteClient:
             "text": text,
             "images": filtered,
             "is_digest": is_digest,
+            "is_event": ("/events." in (final_url or url).lower()) or ("/events/" in (final_url or url).lower()),
             "title": extracted_title or "",
             "date": extracted_date or "",
             "canonical_url": final_url or url,
         }
 
     def _is_candidate_image(self, src: str) -> bool:
+        src_l = src.lower()
+        # Служебные иконки меню/футера не должны попадать в публикацию.
+        if any(
+            token in src_l
+            for token in (
+                "/i/alumni/icons/",
+                "/i/alumni/icon/",
+                "menu_logo",
+                "/ext/digest/more.png",
+                "valid-xhtml",
+            )
+        ):
+            return False
         allowed_ext = (".jpg", ".jpeg", ".png", ".webp", ".gif")
-        if "raw.php" in src:
+        if "raw.php" in src_l:
             return True
-        if src.lower().endswith(allowed_ext):
+        if src_l.endswith(allowed_ext):
             pass
         else:
             return False
@@ -297,10 +323,10 @@ class SiteClient:
         """
         html = unescape(html)
         patterns = [
-            r'<section class="container content"[^>]*>(.*?)</section>',
             r'<div class="main_col"[^>]*>(.*?)<div class="clear">',
             r'<div class="content"[^>]*>(.*?)<div class="clear">',
             r'<div class="right_col"[^>]*>(.*?)<div class="clear">',
+            r'<section class="container content"[^>]*>(.*?)</section>',
         ]
         for pat in patterns:
             m = re.search(pat, html, re.S)
@@ -454,8 +480,16 @@ class SiteClient:
         text = re.sub(r"<[^>]+>", " ", html)
         return re.sub(r"\s+", " ", text).strip()
 
-    def _clean_text(self, text: str, title: Optional[str], is_digest: bool = False) -> str:
+    def _clean_text(
+        self,
+        text: str,
+        title: Optional[str],
+        is_digest: bool = False,
+        source_url: Optional[str] = None,
+    ) -> str:
         text = text.replace("\xa0", " ")
+        source_url_l = (source_url or "").lower()
+        is_events = "/events." in source_url_l or "/events/" in source_url_l
         if is_digest:
             marker = re.search(r"юбилейные\s+встречи", text, flags=re.I)
             if marker:
@@ -488,6 +522,15 @@ class SiteClient:
             "powered by dynacont",
             "on.econ",
         )
+        if is_events:
+            # В Events-страницах после текста часто прилипает левое меню/навигация факультета.
+            footer_markers = footer_markers + (
+                "career карьера",
+                "talk общение",
+                "calendar календарь событий",
+                "cv конструктор резюме",
+                "главная главная",
+            )
         lower_text = text.lower()
         cut_idx = None
         for marker in footer_markers:
