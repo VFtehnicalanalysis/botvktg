@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
-from html.parser import HTMLParser
 from html import unescape
+from html.parser import HTMLParser
 from typing import Dict, List, Optional
 
 import httpx
@@ -160,33 +160,96 @@ class SiteClient:
         return _is_news_link(url_l)
 
     async def fetch_latest_news(self) -> Optional[Dict[str, object]]:
-        url = f"{self.config.site_base_url}{self.config.site_news_path}"
-        resp = await self.client.get(url)
-        resp.raise_for_status()
-        html = unescape(resp.text)
-        # Пытаемся вытащить свежую запись из "Ленты событий" и поддерживаем Article/News ссылки
+        items = await self.fetch_recent_news(limit=1)
+        return items[0] if items else None
+
+    async def fetch_recent_news(self, limit: int = 10) -> List[Dict[str, object]]:
+        requested_limit = max(1, int(limit))
+        had_error = False
+        last_error = ""
+        for base_url in self._feed_base_candidates():
+            feed_url = self._build_feed_url(base_url)
+            try:
+                resp = await self.client.get(feed_url)
+                resp.raise_for_status()
+            except Exception as exc:  # noqa: BLE001
+                had_error = True
+                last_error = str(exc).strip() or type(exc).__name__
+                log.warning("Failed to fetch site feed %s: %s", feed_url, last_error)
+                continue
+            html = unescape(resp.text)
+            items = self._extract_feed_items(html=html, base_url=base_url, limit=requested_limit)
+            if items:
+                return items
+            log.warning("No feed items found at %s", feed_url)
+        if had_error:
+            raise RuntimeError(f"Site feed is unavailable: {last_error}")
+        return []
+
+    def _build_feed_url(self, base_url: str) -> str:
+        clean_base = (base_url or "").strip().rstrip("/")
+        news_path = self.config.site_news_path or "/alumni/"
+        clean_path = news_path if news_path.startswith("/") else f"/{news_path}"
+        return f"{clean_base}{clean_path}"
+
+    def _feed_base_candidates(self) -> List[str]:
+        base = (self.config.site_base_url or "").strip().rstrip("/")
+        candidates: List[str] = []
+
+        def add(candidate: str) -> None:
+            normalized = candidate.strip().rstrip("/")
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+
+        add(base)
+        match = re.match(r"^(https?://)([^/]+)$", base, re.I)
+        if match:
+            scheme = match.group(1)
+            host = match.group(2)
+            if host.startswith("www."):
+                add(f"{scheme}{host[4:]}")
+            else:
+                add(f"{scheme}www.{host}")
+        return candidates
+
+    def _extract_feed_items(self, html: str, base_url: str, limit: int = 10) -> List[Dict[str, object]]:
+        requested_limit = max(1, int(limit))
+        # Пытаемся вытащить свежие записи из "Ленты событий" и поддерживаем Article/News ссылки.
         parser = FeedParser()
         parser.feed(html)
         if parser.items:
-            item = parser.items[0]
-            full_url = _abs_url(self.config.site_base_url, item["url"])
-            title = item.get("title", "")
-            return {
-                "url": full_url,
-                "title": title,
-                "date": item.get("date", ""),
-                "is_digest": self._is_digest(title, url=full_url),
-            }
+            results: List[Dict[str, object]] = []
+            seen_urls = set()
+            for item in parser.items:
+                raw_url = str(item.get("url") or "").strip()
+                if not raw_url:
+                    continue
+                full_url = _abs_url(base_url, raw_url)
+                if full_url in seen_urls:
+                    continue
+                seen_urls.add(full_url)
+                title = str(item.get("title") or "").strip()
+                results.append(
+                    {
+                        "url": full_url,
+                        "title": title,
+                        "date": item.get("date", ""),
+                        "is_digest": self._is_digest(title, url=full_url),
+                    }
+                )
+                if len(results) >= requested_limit:
+                    break
+            if results:
+                return results
 
-        # Fallback на старую вёрстку
+        # Fallback на старую вёрстку.
         block_match = re.search(
             r'<div class="w33 headline status-Published"[^>]*>(.*?)</div>\s*</div>',
             html,
             re.S,
         )
         if not block_match:
-            log.warning("No news block found on alumni page")
-            return None
+            return []
         block_html = block_match.group(1)
         link_match = re.search(
             r'<h3 class="news_text">\s*<a href="([^"]+)"[^>]*>(.*?)</a>',
@@ -195,25 +258,25 @@ class SiteClient:
         )
         date_block = re.search(r'<p class="title_text">(.*?)</p>', block_html, re.S)
         if not link_match:
-            log.warning("No link found inside news block")
-            return None
+            return []
         link = link_match.group(1).strip()
         if not _is_news_link(link):
-            log.warning("Latest link is not Article/News: %s", link)
-            return None
+            return []
         title = re.sub(r"<[^>]+>", "", link_match.group(2)).strip()
         if date_block:
             date = re.sub(r"<[^>]+>", " ", date_block.group(1))
             date = re.sub(r"\s+", " ", date).strip()
         else:
             date = ""
-        full_url = _abs_url(self.config.site_base_url, link)
-        return {
-            "url": full_url,
-            "title": title,
-            "date": date,
-            "is_digest": self._is_digest(title, url=full_url),
-        }
+        full_url = _abs_url(base_url, link)
+        return [
+            {
+                "url": full_url,
+                "title": title,
+                "date": date,
+                "is_digest": self._is_digest(title, url=full_url),
+            }
+        ]
 
     async def fetch_news_detail(self, url: str, title: Optional[str] = None) -> Dict[str, object]:
         resp = await self.client.get(url, follow_redirects=True)
@@ -221,6 +284,8 @@ class SiteClient:
         html = unescape(resp.text)
         final_url = str(resp.url)
         content_html = self._extract_main_block(html)
+        tags = self._extract_tags(html)
+        content_html = self._remove_tag_blocks(content_html)
         content_for_text = self._inject_digest_more_markers(content_html)
         extracted_title = title or self._extract_title(content_html, html)
         extracted_date = self._extract_date(content_html, html)
@@ -269,6 +334,7 @@ class SiteClient:
             "is_event": ("/events." in (final_url or url).lower()) or ("/events/" in (final_url or url).lower()),
             "title": extracted_title or "",
             "date": extracted_date or "",
+            "tags": tags,
             "canonical_url": final_url or url,
         }
 
@@ -306,16 +372,39 @@ class SiteClient:
             if checks >= max_results * 2:
                 break
             checks += 1
-            try:
-                r = await self.client.get(url, follow_redirects=True, timeout=10.0)
-                ctype = r.headers.get("content-type", "")
-                if r.is_success and ctype.startswith("image"):
-                    good.append(url)
-                else:
-                    log.warning("Skip image (status/content-type): %s %s", r.status_code, url)
-            except httpx.RequestError as exc:
-                log.warning("Skip image (request error): %s -> %s", url, exc)
+            validated = False
+            for timeout in (10.0, 25.0):
+                try:
+                    r = await self.client.get(url, follow_redirects=True, timeout=timeout)
+                    ctype = (r.headers.get("content-type", "") or "").lower()
+                    if r.is_success and (ctype.startswith("image") or self._looks_like_image_content(r.content)):
+                        good.append(url)
+                        validated = True
+                    elif timeout >= 25.0:
+                        log.warning("Skip image (status/content-type): %s %s", r.status_code, url)
+                    # Не ретраим не-image ответы: это, как правило, стабильный результат.
+                    break
+                except httpx.RequestError as exc:
+                    if timeout >= 25.0:
+                        err_text = str(exc).strip() or type(exc).__name__
+                        log.warning("Skip image (request error): %s -> %s", url, err_text)
+            if validated:
+                continue
         return good
+
+    def _looks_like_image_content(self, content: bytes) -> bool:
+        if not content:
+            return False
+        signatures = (
+            b"\xff\xd8\xff",  # jpg
+            b"\x89PNG\r\n\x1a\n",  # png
+            b"GIF87a",  # gif
+            b"GIF89a",  # gif
+            b"RIFF",  # webp container
+        )
+        if content.startswith(b"RIFF") and b"WEBP" in content[:16]:
+            return True
+        return any(content.startswith(sig) for sig in signatures[:-1])
 
     def _extract_main_block(self, html: str) -> str:
         """
@@ -323,6 +412,7 @@ class SiteClient:
         """
         html = unescape(html)
         patterns = [
+            r'<div class="canvas_event_page"[^>]*>(.*?)<div class="pseudo_footer">',
             r'<div class="main_col"[^>]*>(.*?)<div class="clear">',
             r'<div class="content"[^>]*>(.*?)<div class="clear">',
             r'<div class="right_col"[^>]*>(.*?)<div class="clear">',
@@ -333,6 +423,35 @@ class SiteClient:
             if m:
                 return m.group(1)
         return html
+
+    def _remove_tag_blocks(self, html: str) -> str:
+        if not html:
+            return ""
+        return re.sub(
+            r'<div class="dc2TagList"[^>]*>.*?</div>',
+            "",
+            html,
+            flags=re.I | re.S,
+        )
+
+    def _extract_tags(self, html: str) -> List[str]:
+        if not html:
+            return []
+        tags: List[str] = []
+        seen = set()
+        blocks = re.findall(r'<div class="dc2TagList"[^>]*>(.*?)</div>', html, flags=re.I | re.S)
+        for block in blocks:
+            for raw_tag in re.findall(r"<a[^>]*>(.*?)</a>", block, flags=re.I | re.S):
+                cleaned = self._strip_tags(raw_tag).replace("\xa0", " ").strip()
+                cleaned = re.sub(r"\s+", " ", cleaned)
+                if not cleaned:
+                    continue
+                key = cleaned.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                tags.append(cleaned)
+        return tags
 
     def _extract_aef_news_icon_images(self, html: str) -> List[str]:
         urls: List[str] = []

@@ -25,6 +25,11 @@ class Config:
     site_base_url: str = "https://www.econ.msu.ru"
     site_news_path: str = "/alumni/"
     site_poll_interval: int = 900  # seconds
+    user_response_interval_seconds: float = 1.0
+    monitor_min_interval_seconds: int = 60
+    restart_backoff_seconds: int = 5
+    monitor_inactivity_restart_seconds: int = 300
+    restart_reason_path: Path = Path("restart_reason.txt")
 
     @property
     def moderation_required(self) -> bool:
@@ -101,6 +106,15 @@ def load_config(password_file: Path = Path("password"), dry_run: bool = False) -
             parsed.append(value)
         return tuple(parsed)
 
+    def get_float(name: str, default: float) -> float:
+        raw = str(get(name, str(default)) or "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
     vk_group_id = get_int("VK_GROUP_ID", 0)
     vk_token = get("VK_GROUP_TOKEN", "")
     vk_user_token = get("VK_USER_TOKEN", "")
@@ -110,6 +124,14 @@ def load_config(password_file: Path = Path("password"), dry_run: bool = False) -
     moderator_ids = get_int_list("MODERATOR_IDS", ())
     moderation_mode = get("MODERATION_MODE", "required").lower()
     source_mode = get("SOURCE_MODE", "vk+site").lower()
+    site_base_url = str(get("SITE_BASE_URL", "https://www.econ.msu.ru") or "").strip() or "https://www.econ.msu.ru"
+    site_news_path = str(get("SITE_NEWS_PATH", "/alumni/") or "").strip() or "/alumni/"
+    site_poll_interval = max(60, get_int("SITE_POLL_INTERVAL", 900))
+    user_response_interval_seconds = max(0.0, get_float("USER_RESPONSE_INTERVAL_SECONDS", 1.0))
+    monitor_min_interval_seconds = max(1, get_int("MONITOR_MIN_INTERVAL_SECONDS", 60))
+    restart_backoff_seconds = max(1, get_int("RESTART_BACKOFF_SECONDS", 5))
+    monitor_inactivity_restart_seconds = max(60, get_int("MONITOR_INACTIVITY_RESTART_SECONDS", 300))
+    restart_reason_path = Path(str(get("RESTART_REASON_PATH", "restart_reason.txt") or "restart_reason.txt"))
 
     return Config(
         vk_group_id=vk_group_id,
@@ -121,7 +143,15 @@ def load_config(password_file: Path = Path("password"), dry_run: bool = False) -
         moderator_ids=moderator_ids,
         moderation_mode=moderation_mode,
         source_mode=source_mode,
+        site_base_url=site_base_url.rstrip("/"),
+        site_news_path=site_news_path if site_news_path.startswith("/") else f"/{site_news_path}",
+        site_poll_interval=site_poll_interval,
         dry_run=dry_run,
         log_dir=Path("logs"),
         state_path=Path("state.json"),
+        user_response_interval_seconds=user_response_interval_seconds,
+        monitor_min_interval_seconds=monitor_min_interval_seconds,
+        restart_backoff_seconds=restart_backoff_seconds,
+        monitor_inactivity_restart_seconds=monitor_inactivity_restart_seconds,
+        restart_reason_path=restart_reason_path,
     )

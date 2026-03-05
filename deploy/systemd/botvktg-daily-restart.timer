@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily 09:30 MSK restart timer for botvktg
+
+[Timer]
+OnCalendar=*-*-* 09:30:00 Europe/Moscow
+Persistent=true
+Unit=botvktg-daily-restart.service
+
+[Install]
+WantedBy=timers.target

@@ -119,7 +119,12 @@ class VKClient:
                 self._warned_wall_get_modes.add(mode)
         return []
 
-    async def wall_post(self, message: str, attachments: Optional[List[str]] = None) -> Optional[int]:
+    async def wall_post(
+        self,
+        message: str,
+        attachments: Optional[List[str]] = None,
+        publish_date: Optional[int] = None,
+    ) -> Optional[int]:
         if not self.config.vk_group_id or not self.config.vk_token:
             raise RuntimeError("VK credentials are not configured")
         params: Dict[str, Any] = {
@@ -129,6 +134,8 @@ class VKClient:
         }
         if attachments:
             params["attachments"] = ",".join(attachments)
+        if publish_date:
+            params["publish_date"] = int(publish_date)
         try:
             data = await self._api_call("wall.post", params, access_token=self.config.vk_token)
             return data.get("post_id")
@@ -145,6 +152,8 @@ class VKClient:
                     "from_group": 1,
                     "message": message,
                 }
+                if publish_date:
+                    retry_params["publish_date"] = int(publish_date)
                 data = await self._api_call("wall.post", retry_params, access_token=self.config.vk_token)
                 return data.get("post_id")
             raise

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily planned restart of botvktg
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=vfurasov
+WorkingDirectory=/home/vfurasov/telegram-bot-alumni
+ExecStart=/bin/bash -c 'printf "planned_daily\n" > /home/vfurasov/telegram-bot-alumni/.restart_reason'
+ExecStart=/bin/systemctl restart botvktg.service

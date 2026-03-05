@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
 import httpx
 
@@ -33,6 +34,41 @@ class TelegramClient:
             if not data.get("ok"):
                 log.error("Telegram %s error: %s", method, data)
             return data
+
+    async def _request_form(
+        self,
+        method: str,
+        data: Dict[str, Any],
+        files: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        def rewind_files() -> None:
+            for value in files.values():
+                if not isinstance(value, tuple) or len(value) < 2:
+                    continue
+                stream = value[1]
+                if hasattr(stream, "seek"):
+                    try:
+                        stream.seek(0)
+                    except Exception:  # noqa: BLE001
+                        continue
+
+        while True:
+            rewind_files()
+            resp = await self.client.post(
+                f"{self.base_url}/{method}",
+                data=data,
+                files=files,
+            )
+            if resp.status_code == 429:
+                retry_after = resp.json().get("parameters", {}).get("retry_after", 1)
+                await asyncio.sleep(int(retry_after) + 1)
+                continue
+            if not resp.is_success:
+                log.error("Telegram %s failed: %s", method, resp.text)
+            data_obj = resp.json()
+            if not data_obj.get("ok"):
+                log.error("Telegram %s error: %s", method, data_obj)
+            return data_obj
 
     async def send_message(
         self,
@@ -124,6 +160,26 @@ class TelegramClient:
     async def notify_owner(self, text: str) -> None:
         await self.send_message(chat_id=self.config.owner_id, text=text)
 
+    async def send_document(
+        self,
+        chat_id: int | str,
+        file_path: str | Path,
+        caption: Optional[str] = None,
+        parse_mode: str = "HTML",
+    ) -> Optional[int]:
+        doc_path = Path(file_path)
+        if self.config.dry_run:
+            log.info("[dry-run] sendDocument to %s: %s", chat_id, doc_path)
+            return None
+        data: Dict[str, Any] = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+            data["parse_mode"] = parse_mode
+        with doc_path.open("rb") as fh:
+            files = {"document": (doc_path.name, fh, "text/plain")}
+            resp = await self._request_form("sendDocument", data=data, files=files)
+        return resp.get("result", {}).get("message_id")
+
     async def answer_callback_query(self, callback_id: str, text: Optional[str] = None) -> None:
         payload: Dict[str, Any] = {"callback_query_id": callback_id}
         if text:
@@ -147,6 +203,24 @@ class TelegramClient:
             if await self.delete_message(chat_id=chat_id, message_id=message_id):
                 deleted += 1
         return deleted
+
+    async def edit_message_reply_markup(
+        self,
+        chat_id: int | str,
+        message_id: int,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        if self.config.dry_run:
+            log.info("[dry-run] editMessageReplyMarkup in %s: %s", chat_id, message_id)
+            return True
+        data = await self._request("editMessageReplyMarkup", payload)
+        return bool(data.get("ok"))
 
     async def get_updates(
         self,

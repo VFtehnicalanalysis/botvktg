@@ -1,0 +1,24 @@
+[Unit]
+Description=VK/TG botvktg service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vfurasov
+Group=vfurasov
+WorkingDirectory=/home/vfurasov/telegram-bot-alumni
+Environment=PYTHONUNBUFFERED=1
+Environment=USER_RESPONSE_INTERVAL_SECONDS=1
+Environment=MONITOR_MIN_INTERVAL_SECONDS=60
+Environment=MONITOR_INACTIVITY_RESTART_SECONDS=300
+Environment=RESTART_BACKOFF_SECONDS=5
+Environment=RESTART_REASON_PATH=/home/vfurasov/telegram-bot-alumni/.restart_reason
+ExecStart=/home/vfurasov/telegram-bot-alumni/venv/bin/python3 /home/vfurasov/telegram-bot-alumni/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

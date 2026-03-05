@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -14,6 +15,11 @@ from .tg_client import TelegramClient
 from .site_client import SiteClient
 
 log = logging.getLogger(__name__)
+
+TG_MESSAGE_LIMIT = 3900
+TG_CAPTION_LIMIT = 1024
+MODERATION_MESSAGE_LIMIT = 3900
+VK_NEWS_DELAY_SECONDS = 30 * 60
 
 
 def escape_html(text: str) -> str:
@@ -87,19 +93,24 @@ def _split_block_by_words(text: str, limit: int) -> List[str]:
     return parts
 
 
-def chunk_text(text: str, limit: int = 3500) -> List[str]:
+def chunk_text(text: str, limit: int = TG_MESSAGE_LIMIT) -> List[str]:
     cleaned = (text or "").strip()
     if not cleaned:
         return [""]
     if len(cleaned) <= limit:
         return [cleaned]
-    paragraphs = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
+    paragraph_sep = "\n\n"
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", cleaned) if p.strip()]
+    if len(paragraphs) <= 1 and "\n" in cleaned:
+        # Если нет абзацев через пустую строку, используем строки как мягкие границы чанков.
+        paragraphs = [p.strip() for p in cleaned.splitlines() if p.strip()]
+        paragraph_sep = "\n"
     if not paragraphs:
         return _split_block_by_words(cleaned, limit)
     chunks: List[str] = []
     current = ""
     for paragraph in paragraphs:
-        candidate = paragraph if not current else f"{current}\n\n{paragraph}"
+        candidate = paragraph if not current else f"{current}{paragraph_sep}{paragraph}"
         if len(candidate) <= limit:
             current = candidate
             continue
@@ -164,7 +175,7 @@ def _split_block_with_more_markers(text: str, limit: int) -> List[str]:
     return parts
 
 
-def chunk_text_preserving_more_markers(text: str, limit: int = 3500) -> List[str]:
+def chunk_text_preserving_more_markers(text: str, limit: int = TG_MESSAGE_LIMIT) -> List[str]:
     cleaned = (text or "").strip()
     if not cleaned:
         return [""]
@@ -218,7 +229,7 @@ def chunk_text_preserving_more_markers(text: str, limit: int = 3500) -> List[str
     return chunks or [cleaned]
 
 
-def chunk_news_text(text: str, limit: int = 3500) -> List[str]:
+def chunk_news_text(text: str, limit: int = TG_MESSAGE_LIMIT) -> List[str]:
     """
     Единый чанкер для новостей (events/articles/digest):
     - минимизирует число сообщений за счет плотной упаковки до limit;
@@ -309,6 +320,9 @@ class Pipeline:
             return
         data = cb.get("data") or ""
         cb_id = cb.get("id")
+        cb_message = cb.get("message") or {}
+        cb_chat = cb_message.get("chat") or {}
+        moderator_chat_id = cb_chat.get("id")
         from_user = cb.get("from", {})
         user_id = from_user.get("id")
         actor = self._format_telegram_actor(from_user)
@@ -518,6 +532,12 @@ class Pipeline:
                     is_digest=self._is_digest_payload(payload),
                     actor=actor_for_owner,
                 )
+                if publish_vk and moderator_chat_id is not None:
+                    await self._notify_moderator_vk_schedule_reminder(
+                        chat_id=moderator_chat_id,
+                        payload=payload,
+                        vk_post_id=vk_post_id,
+                    )
                 if cb_id:
                     await self.tg.answer_callback_query(cb_id, text="Опубликовано")
             except Exception as exc:  # noqa: BLE001
@@ -840,11 +860,105 @@ class Pipeline:
             return f"{label} (id={user_id})"
         return label
 
+    def _tag_to_hashtag(self, tag: str) -> Optional[str]:
+        cleaned = re.sub(r"\s+", " ", str(tag or "").replace("\xa0", " ")).strip()
+        if not cleaned:
+            return None
+        body = re.sub(r"[^\w ]+", "", cleaned, flags=re.UNICODE).strip().replace(" ", "_")
+        body = re.sub(r"_+", "_", body).strip("_")
+        if not body:
+            return None
+        return f"#{body.lower()}"
+
+    def _render_news_hashtags(self, payload: Dict[str, Any]) -> str:
+        raw_tags = payload.get("tags")
+        if not isinstance(raw_tags, list):
+            return ""
+        hashtags: List[str] = []
+        seen = set()
+        for raw_tag in raw_tags:
+            hashtag = self._tag_to_hashtag(str(raw_tag))
+            if not hashtag:
+                continue
+            key = hashtag.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            hashtags.append(hashtag)
+        return " ".join(hashtags).strip()
+
+    async def _attach_moderation_keyboard(
+        self,
+        chat_id: int,
+        message_ids: List[int],
+        keyboard: Dict[str, Any],
+    ) -> None:
+        if not message_ids:
+            return
+        target_id = message_ids[-1]
+        try:
+            if await self.tg.edit_message_reply_markup(chat_id, target_id, reply_markup=keyboard):
+                return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to bind moderation keyboard to %s:%s: %s", chat_id, target_id, exc)
+        fallback_id = await self.tg.send_message(
+            chat_id=chat_id,
+            text="Выберите действие:",
+            reply_markup=keyboard,
+        )
+        if fallback_id:
+            message_ids.append(fallback_id)
+
+    async def _send_media_load_failed_notice(self, chat_id: int | str) -> Optional[int]:
+        try:
+            return await self.tg.send_message(chat_id=chat_id, text="не удалось загрузить медиа")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to send media load failed notice to %s: %s", chat_id, exc)
+            return None
+
+    async def _send_moderation_media_preview(
+        self,
+        chat_id: int | str,
+        media_group: Sequence[Dict[str, Any]],
+    ) -> List[int]:
+        if not media_group:
+            return []
+        normalized: List[Dict[str, str]] = []
+        for item in media_group:
+            media_type = str(item.get("type") or "").strip().lower()
+            media_url = str(item.get("media") or "").strip()
+            if media_type != "photo" or not media_url:
+                continue
+            normalized.append({"type": "photo", "media": media_url})
+        if not normalized:
+            notice_id = await self._send_media_load_failed_notice(chat_id)
+            return [notice_id] if notice_id else []
+        if len(normalized) == 1:
+            try:
+                mid = await self.tg.send_photo(chat_id=chat_id, photo=normalized[0]["media"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Failed to send moderation photo preview to %s: %s", chat_id, exc)
+                mid = None
+            if mid:
+                return [mid]
+            notice_id = await self._send_media_load_failed_notice(chat_id)
+            return [notice_id] if notice_id else []
+        try:
+            mids = await self._send_media_group_safe(chat_id, normalized)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to send moderation media group to %s: %s", chat_id, exc)
+            mids = []
+        if len(mids) < len(normalized):
+            notice_id = await self._send_media_load_failed_notice(chat_id)
+            if notice_id:
+                mids.append(notice_id)
+        return mids
+
     def _split_photo_caption_and_chunks(
         self,
         chunks: Sequence[str],
-        caption_limit: int = 1000,
-        body_limit: int = 3500,
+        caption_limit: int = TG_CAPTION_LIMIT,
+        body_limit: int = TG_MESSAGE_LIMIT,
         preserve_more_markers: bool = False,
         fill_caption_from_body: bool = False,
     ) -> Tuple[Optional[str], List[str]]:
@@ -925,11 +1039,13 @@ class Pipeline:
         date = payload.get("date", "") or ""
         link = payload.get("url", "") or ""
         text_body = payload.get("text", "") or ""
+        hashtags = self._render_news_hashtags(payload)
         if html:
             title = escape_html(title)
             date = escape_html(date)
             link = escape_html(link)
             text_body = escape_html(text_body)
+            hashtags = escape_html(hashtags)
             if self._is_events_news(payload=payload):
                 text_body = self._bold_event_fields_html(text_body)
         else:
@@ -942,8 +1058,15 @@ class Pipeline:
         if link:
             lines.append(link)
         full_text = "\n".join(lines)
-        if include_body and text_body:
-            full_text = f"{full_text}\n\n{text_body}" if full_text else text_body
+        if include_body:
+            body_parts: List[str] = []
+            if text_body:
+                body_parts.append(text_body)
+            if hashtags:
+                body_parts.append(hashtags)
+            if body_parts:
+                body = "\n\n".join(body_parts)
+                full_text = f"{full_text}\n\n{body}" if full_text else body
         return full_text.strip()
 
     async def refresh_recent_posts(self, vk_client: "VKClient", count: int = 10, force: bool = False) -> int:  # type: ignore
@@ -980,10 +1103,20 @@ class Pipeline:
     async def refresh_latest_news(self, force: bool = False) -> None:
         if not self.site:
             return
-        latest = await self.site.fetch_latest_news()
-        if not latest:
+        if force:
+            latest = await self.site.fetch_latest_news()
+            if not latest:
+                return
+            await self.handle_news(latest, force=True)
             return
-        await self.handle_news(latest, force=force)
+
+        # Обрабатываем несколько верхних элементов ленты:
+        # если верхний уже published/rejected, не блокируем более свежие ниже по списку.
+        recent_items = await self.site.fetch_recent_news(limit=10)
+        if not recent_items:
+            return
+        for news_item in reversed(recent_items):
+            await self.handle_news(news_item, force=False)
 
     async def _send_for_moderation(
         self,
@@ -1022,33 +1155,26 @@ class Pipeline:
                     ]
                 ]
             }
-        parts = chunk_text(full_text, limit=1000)
+        parts = chunk_text(full_text, limit=MODERATION_MESSAGE_LIMIT)
         media: List[Dict[str, Any]] = payload.get("media") or []
         poll = payload.get("poll")
         message_ids_by_chat: Dict[int, List[int]] = {}
         for moderator_id in self._moderation_target_ids():
             message_ids: List[int] = []
             try:
-                first_id = await self.tg.send_message(
-                    chat_id=moderator_id, text=parts[0], reply_markup=keyboard
-                )
+                first_id = await self.tg.send_message(chat_id=moderator_id, text=parts[0])
                 if first_id:
                     message_ids.append(first_id)
                 for extra in parts[1:]:
                     mid = await self.tg.send_message(chat_id=moderator_id, text=extra)
                     if mid:
                         message_ids.append(mid)
-                if len(media) == 1:
-                    m = media[0]
-                    if m["type"] == "photo":
-                        mid = await self.tg.send_photo(chat_id=moderator_id, photo=m["url"])
-                        if mid:
-                            message_ids.append(mid)
-                elif len(media) > 1:
-                    group = [{"type": m["type"], "media": m["url"]} for m in media if m.get("url")]
-                    if group:
-                        mids = await self.tg.send_media_group(chat_id=moderator_id, media=group)
-                        message_ids.extend(mids)
+                media_group = [
+                    {"type": m.get("type"), "media": m.get("url")}
+                    for m in media
+                    if isinstance(m, dict)
+                ]
+                message_ids.extend(await self._send_moderation_media_preview(moderator_id, media_group))
                 if poll:
                     mid = await self.tg.send_poll(
                         chat_id=moderator_id,
@@ -1058,6 +1184,11 @@ class Pipeline:
                     )
                     if mid:
                         message_ids.append(mid)
+                await self._attach_moderation_keyboard(
+                    chat_id=moderator_id,
+                    message_ids=message_ids,
+                    keyboard=keyboard,
+                )
             except Exception as exc:  # noqa: BLE001
                 log.warning("Failed to send post moderation preview to %s: %s", moderator_id, exc)
                 continue
@@ -1077,22 +1208,34 @@ class Pipeline:
         message_ids: List[int] = []
 
         escaped_text = escape_html(text)
-        chunks = chunk_text(escaped_text, limit=3500)
+        chunks = chunk_text(escaped_text, limit=TG_MESSAGE_LIMIT)
 
         if media:
             if len(media) == 1:
                 m = media[0]
                 cap, extra_chunks = self._split_photo_caption_and_chunks(
                     chunks,
-                    caption_limit=1000,
-                    body_limit=3500,
+                    caption_limit=TG_CAPTION_LIMIT,
+                    body_limit=TG_MESSAGE_LIMIT,
                     preserve_more_markers=False,
                 )
-                msg_id = await self.tg.send_photo(
-                    chat_id=self.config.tg_channel_id, photo=m["url"], caption=cap
-                )
+                try:
+                    msg_id = await self.tg.send_photo(
+                        chat_id=self.config.tg_channel_id, photo=m["url"], caption=cap
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Failed to send photo to channel %s: %s", self.config.tg_channel_id, exc)
+                    msg_id = None
                 if msg_id:
                     message_ids.append(msg_id)
+                elif cap:
+                    # Если Telegram отклонил фото по URL, не теряем первый кусок текста.
+                    fallback_mid = await self.tg.send_message(
+                        chat_id=self.config.tg_channel_id,
+                        text=cap,
+                    )
+                    if fallback_mid:
+                        message_ids.append(fallback_mid)
                 for extra in extra_chunks:
                     mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra)
                     if mid:
@@ -1100,8 +1243,8 @@ class Pipeline:
             else:
                 caption, extra_chunks = self._split_photo_caption_and_chunks(
                     chunks,
-                    caption_limit=1000,
-                    body_limit=3500,
+                    caption_limit=TG_CAPTION_LIMIT,
+                    body_limit=TG_MESSAGE_LIMIT,
                     preserve_more_markers=False,
                 )
                 group: List[Dict[str, Any]] = []
@@ -1113,6 +1256,14 @@ class Pipeline:
                     group.append(entry)
                 mids = await self._send_media_group_safe(self.config.tg_channel_id, group)
                 message_ids.extend(mids)
+                if not mids and caption:
+                    # Полный фейл группы: публикуем caption как обычное сообщение.
+                    fallback_mid = await self.tg.send_message(
+                        chat_id=self.config.tg_channel_id,
+                        text=caption,
+                    )
+                    if fallback_mid:
+                        message_ids.append(fallback_mid)
                 for extra in extra_chunks:
                     mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra)
                     if mid:
@@ -1180,6 +1331,7 @@ class Pipeline:
             "date": date,
             "text": detail.get("text", ""),
             "images": detail.get("images", []),
+            "tags": detail.get("tags", []),
             "is_event": bool(detail.get("is_event"))
             or "/events." in canonical_url.lower()
             or "/events/" in canonical_url.lower(),
@@ -1209,9 +1361,6 @@ class Pipeline:
             await self._publish_news(url, payload)
 
     async def _send_news_for_moderation(self, url: str, payload: Dict[str, Any], token: Optional[str]) -> None:
-        text_body = escape_html(payload.get("text", "")) or "(без текста)"
-        if self._is_events_news(url=url, payload=payload):
-            text_body = self._bold_event_fields_html(text_body)
         is_digest = self._is_digest_news(url=url, payload=payload)
         log.info(
             "News moderation type digest=%s source_url=%s payload_url=%s payload_is_digest=%s",
@@ -1221,8 +1370,8 @@ class Pipeline:
             payload.get("is_digest"),
         )
         header_prefix = "Новый дайджест на сайте" if is_digest else "Новая новость на сайте"
-        header = f"{header_prefix}:\n{self._format_news_text(payload, html=True, include_body=False)}"
-        chunks = chunk_news_text(f"{header}\n\n{text_body}", limit=3500)
+        formatted = self._format_news_text(payload, html=True, include_body=True) or "(без текста)"
+        chunks = chunk_news_text(f"{header_prefix}:\n{formatted}", limit=MODERATION_MESSAGE_LIMIT)
         keyboard = {
             "inline_keyboard": [
                 [
@@ -1242,9 +1391,7 @@ class Pipeline:
         for moderator_id in self._moderation_target_ids():
             message_ids: List[int] = []
             try:
-                first_id = await self.tg.send_message(
-                    chat_id=moderator_id, text=first_text, reply_markup=keyboard
-                )
+                first_id = await self.tg.send_message(chat_id=moderator_id, text=first_text)
                 if first_id:
                     message_ids.append(first_id)
                 for extra in chunks[1:]:
@@ -1252,14 +1399,13 @@ class Pipeline:
                     mid = await self.tg.send_message(chat_id=moderator_id, text=extra_text)
                     if mid:
                         message_ids.append(mid)
-                if len(images) == 1:
-                    mid = await self.tg.send_photo(chat_id=moderator_id, photo=images[0])
-                    if mid:
-                        message_ids.append(mid)
-                elif len(images) > 1:
-                    media = [{"type": "photo", "media": img} for img in images]
-                    mids = await self._send_media_group_safe(moderator_id, media)
-                    message_ids.extend(mids)
+                media_group = [{"type": "photo", "media": img} for img in images]
+                message_ids.extend(await self._send_moderation_media_preview(moderator_id, media_group))
+                await self._attach_moderation_keyboard(
+                    chat_id=moderator_id,
+                    message_ids=message_ids,
+                    keyboard=keyboard,
+                )
             except Exception as exc:  # noqa: BLE001
                 log.warning("Failed to send news moderation preview to %s: %s", moderator_id, exc)
                 continue
@@ -1287,7 +1433,7 @@ class Pipeline:
             log.info("Published news to Telegram: %s", url)
         if publish_vk:
             vk_post_id = await self._publish_news_vk(payload)
-            log.info("Published news to VK: %s", url)
+            log.info("Scheduled news post in VK (+%s sec): %s", VK_NEWS_DELAY_SECONDS, url)
         published_to = "tg" if publish_tg else None
         if publish_vk and publish_tg:
             published_to = "both"
@@ -1310,7 +1456,7 @@ class Pipeline:
     async def _publish_news_tg(self, payload: Dict[str, Any]) -> List[int]:
         full_text = self._format_news_text(payload, html=True)
         message_ids: List[int] = []
-        chunks = chunk_news_text(full_text, limit=3500)
+        chunks = chunk_news_text(full_text, limit=TG_MESSAGE_LIMIT)
         all_images: List[str] = payload.get("images", []) or []
         images: List[str] = all_images[:1] if self._is_digest_news(payload=payload) else all_images[:10]
 
@@ -1318,24 +1464,36 @@ class Pipeline:
             if len(images) == 1:
                 caption, extra_chunks = self._split_photo_caption_and_chunks(
                     chunks,
-                    caption_limit=1000,
-                    body_limit=3500,
+                    caption_limit=TG_CAPTION_LIMIT,
+                    body_limit=TG_MESSAGE_LIMIT,
                     preserve_more_markers=True,
                     fill_caption_from_body=True,
                 )
                 rendered_caption = self._render_digest_more_links(caption or "", html=True) or None
-                if rendered_caption and len(rendered_caption) > 1000:
-                    first_parts = chunk_news_text(caption or "", limit=900)
+                if rendered_caption and len(rendered_caption) > TG_CAPTION_LIMIT:
+                    first_parts = chunk_news_text(caption or "", limit=980)
                     caption = first_parts[0] if first_parts else ""
                     rendered_caption = self._render_digest_more_links(caption, html=True) or None
                     extra_chunks = [part for part in first_parts[1:] if part] + extra_chunks
-                mid = await self.tg.send_photo(
-                    chat_id=self.config.tg_channel_id,
-                    photo=images[0],
-                    caption=rendered_caption,
-                )
+                try:
+                    mid = await self.tg.send_photo(
+                        chat_id=self.config.tg_channel_id,
+                        photo=images[0],
+                        caption=rendered_caption,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Failed to send news photo to channel %s: %s", self.config.tg_channel_id, exc)
+                    mid = None
                 if mid:
                     message_ids.append(mid)
+                elif rendered_caption:
+                    # Гарантируем, что начало новости не пропадет при ошибке sendPhoto.
+                    fallback_mid = await self.tg.send_message(
+                        chat_id=self.config.tg_channel_id,
+                        text=rendered_caption,
+                    )
+                    if fallback_mid:
+                        message_ids.append(fallback_mid)
                 for extra in extra_chunks:
                     extra_text = self._render_digest_more_links(extra, html=True)
                     mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra_text)
@@ -1344,14 +1502,14 @@ class Pipeline:
             else:
                 caption, extra_chunks = self._split_photo_caption_and_chunks(
                     chunks,
-                    caption_limit=1000,
-                    body_limit=3500,
+                    caption_limit=TG_CAPTION_LIMIT,
+                    body_limit=TG_MESSAGE_LIMIT,
                     preserve_more_markers=True,
                     fill_caption_from_body=True,
                 )
                 rendered_caption = self._render_digest_more_links(caption or "", html=True) or None
-                if rendered_caption and len(rendered_caption) > 1000:
-                    first_parts = chunk_news_text(caption or "", limit=900)
+                if rendered_caption and len(rendered_caption) > TG_CAPTION_LIMIT:
+                    first_parts = chunk_news_text(caption or "", limit=980)
                     caption = first_parts[0] if first_parts else ""
                     rendered_caption = self._render_digest_more_links(caption, html=True) or None
                     extra_chunks = [part for part in first_parts[1:] if part] + extra_chunks
@@ -1364,6 +1522,13 @@ class Pipeline:
                     group.append(entry)
                 mids = await self._send_media_group_safe(self.config.tg_channel_id, group)
                 message_ids.extend(mids)
+                if not mids and rendered_caption:
+                    fallback_mid = await self.tg.send_message(
+                        chat_id=self.config.tg_channel_id,
+                        text=rendered_caption,
+                    )
+                    if fallback_mid:
+                        message_ids.append(fallback_mid)
                 for extra in extra_chunks:
                     extra_text = self._render_digest_more_links(extra, html=True)
                     mid = await self.tg.send_message(chat_id=self.config.tg_channel_id, text=extra_text)
@@ -1403,10 +1568,19 @@ class Pipeline:
                         "posting without attachments and relying on link preview: %s",
                         source_link,
                     )
+        publish_date = int(time.time()) + VK_NEWS_DELAY_SECONDS
         if self.config.dry_run:
-            log.info("[dry-run] VK wall.post: %s", text[:200])
+            log.info(
+                "[dry-run] VK wall.post (scheduled in %s sec): %s",
+                VK_NEWS_DELAY_SECONDS,
+                text[:200],
+            )
             return None
-        return await self.vk.wall_post(message=text, attachments=attachments)
+        return await self.vk.wall_post(
+            message=text,
+            attachments=attachments,
+            publish_date=publish_date,
+        )
 
     def _build_tg_message_link(self, message_ids: Sequence[int]) -> Optional[str]:
         if not message_ids:
@@ -1432,7 +1606,6 @@ class Pipeline:
     def _owner_menu_keyboard(self) -> Dict[str, Any]:
         return {
             "inline_keyboard": [
-                [{"text": "🔄 Обновить посты", "callback_data": "refresh_posts"}],
                 [{"text": "📌 Крайний пост VK", "callback_data": "latest_vk"}],
                 [{"text": "📰 Крайняя новость сайта", "callback_data": "latest_site"}],
                 [{"text": "🔗 Новость по ссылке", "callback_data": "news_by_link"}],
@@ -1500,9 +1673,14 @@ class Pipeline:
         if is_digest:
             lines = ["Публикация дайджеста отклонена."]
         if published:
-            lines[0] = "Новость опубликована."
-            if is_digest:
-                lines[0] = "Дайджест опубликован."
+            if publish_vk and not publish_tg:
+                lines[0] = "Новость запланирована к публикации в ВК."
+                if is_digest:
+                    lines[0] = "Дайджест запланирован к публикации в ВК."
+            else:
+                lines[0] = "Новость опубликована."
+                if is_digest:
+                    lines[0] = "Дайджест опубликован."
             published_links: List[str] = []
             if tg_link:
                 published_links.append(f"TG: {tg_link}")
@@ -1510,6 +1688,8 @@ class Pipeline:
                 published_links.append(f"ВК: {vk_link}")
             if published_links:
                 lines.append(f"Публикация: {', '.join(published_links)}")
+            if publish_vk:
+                lines.append("ВК: отложенная публикация через 30 минут.")
         lines.append(f"Исходная новость: {source_link}")
         if actor:
             lines.append(f"Действие модератора: {actor}")
@@ -1517,6 +1697,37 @@ class Pipeline:
             await self._notify_owner_with_menu("\n".join(lines))
         except Exception as exc:  # noqa: BLE001
             log.warning("Failed to notify owner about news moderation result: %s", exc)
+
+    async def _notify_moderator_vk_schedule_reminder(
+        self,
+        chat_id: int | str,
+        payload: Dict[str, Any],
+        vk_post_id: Optional[int],
+    ) -> None:
+        vk_link = self._build_vk_post_link(vk_post_id)
+        if not vk_link:
+            return
+        vk_link_html = escape_html(vk_link)
+        reminder = (
+            "Не забудьте прикрепить фото к отложенному посту в ВК.\n"
+            f'<a href="{vk_link_html}">ссылка на отложенный пост</a>'
+        )
+        images_raw = payload.get("images")
+        image_url = ""
+        if isinstance(images_raw, list):
+            for item in images_raw:
+                candidate = str(item or "").strip()
+                if candidate:
+                    image_url = candidate
+                    break
+        try:
+            if image_url:
+                sent_id = await self.tg.send_photo(chat_id=chat_id, photo=image_url, caption=reminder)
+                if sent_id:
+                    return
+            await self.tg.send_message(chat_id=chat_id, text=reminder)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to send VK schedule reminder to moderator chat %s: %s", chat_id, exc)
 
     async def _delete_post_moderation_messages(self, post_id: int) -> None:
         message_map = await self.state.get_moderation_message_id_map(post_id)
@@ -1591,15 +1802,43 @@ class Pipeline:
     async def _send_media_group_safe(self, chat_id: int | str, group: List[Dict[str, Any]]) -> List[int]:
         if not group:
             return []
-        mids = await self.tg.send_media_group(chat_id=chat_id, media=group)
+        try:
+            mids = await self.tg.send_media_group(chat_id=chat_id, media=group)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("sendMediaGroup failed for %s: %s", chat_id, exc)
+            mids = []
         if len(mids) == len(group):
             return mids
         log.warning("Media group failed or partial (sent %s of %s), falling back to single sends", len(mids), len(group))
         fallback_ids: List[int] = []
-        for item in group:
+        for idx, item in enumerate(group):
             caption = item.get("caption")
             parse_mode = item.get("parse_mode", "HTML")
-            mid = await self.tg.send_photo(chat_id=chat_id, photo=item["media"], caption=caption, parse_mode=parse_mode)
+            try:
+                mid = await self.tg.send_photo(
+                    chat_id=chat_id,
+                    photo=item["media"],
+                    caption=caption,
+                    parse_mode=parse_mode,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Fallback sendPhoto failed for %s: %s", chat_id, exc)
+                mid = None
             if mid:
                 fallback_ids.append(mid)
+                continue
+            if idx == 0 and caption:
+                # Если первый элемент с caption не отправился как фото,
+                # отправляем caption отдельно, чтобы не потерять начало текста.
+                try:
+                    text_mid = await self.tg.send_message(
+                        chat_id=chat_id,
+                        text=str(caption),
+                        parse_mode=str(parse_mode),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Fallback caption send failed for %s: %s", chat_id, exc)
+                    text_mid = None
+                if text_mid:
+                    fallback_ids.append(text_mid)
         return fallback_ids
